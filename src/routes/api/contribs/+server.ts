@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { collectContributionSummary } from '$lib/server/gitStats';
+import { collectContributionSummary, type ProgressEvent } from '$lib/server/gitStats';
 import type { RepoContributionSummary } from '$lib/types';
 import type { RequestHandler } from './$types';
 
@@ -31,8 +31,87 @@ export const POST: RequestHandler = async ({ request }) => {
 	const slug = `${owner}/${repo}`;
 
 	try {
-		const summary = await collectContributionSummary(slug, limit);
-		return json(serializeSummary(summary));
+		const stream = new ReadableStream({
+			start(controller) {
+				const encoder = new TextEncoder();
+				let closed = false;
+
+				const send = (payload: unknown) => {
+					if (closed) {
+						return;
+					}
+					controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
+				};
+
+				const close = () => {
+					if (!closed) {
+						closed = true;
+						controller.close();
+					}
+				};
+
+				const abortWith = (error: unknown) => {
+					if (!closed) {
+						closed = true;
+						const reason = error instanceof Error ? error : new Error(String(error));
+						controller.error(reason);
+					}
+				};
+
+				const { signal } = request;
+				if (signal.aborted) {
+					abortWith(new Error('Request aborted'));
+					return;
+				}
+
+				const handleProgress = (event: ProgressEvent) => {
+					if (event.type === 'git') {
+						send({
+							type: 'git',
+							command: event.command,
+							stream: event.stream,
+							text: event.text
+						});
+						return;
+					}
+
+					send({ type: 'status', message: event.message });
+				};
+
+				const abortListener = () => {
+					abortWith(new Error('Request aborted'));
+				};
+
+				signal.addEventListener('abort', abortListener);
+
+				(async () => {
+					try {
+						const summary = await collectContributionSummary(slug, limit, {
+							onProgress: handleProgress,
+							signal
+						});
+						send({ type: 'result', summary: serializeSummary(summary) });
+					} catch (error) {
+						if (!signal.aborted) {
+							send({ type: 'error', message: (error as Error).message ?? 'Unknown error' });
+						}
+					} finally {
+						signal.removeEventListener('abort', abortListener);
+						close();
+					}
+				})().catch((error) => {
+					signal.removeEventListener('abort', abortListener);
+					abortWith(error);
+				});
+			}
+		});
+
+		return new Response(stream, {
+			headers: {
+				'Content-Type': 'application/x-ndjson',
+				'Cache-Control': 'no-cache'
+			}
+		});
 	} catch (error) {
 		return json({ error: (error as Error).message }, { status: 500 });
 	}

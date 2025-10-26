@@ -26,6 +26,8 @@
   let loading = $state(false);
   let errorMessage = $state("");
   let summary = $state<SummaryPayload | null>(null);
+  let progressMessages = $state<string[]>([]);
+  let activeController: AbortController | null = null;
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -52,8 +54,13 @@
       return;
     }
 
+    activeController?.abort();
+    const controller = new AbortController();
+    activeController = controller;
+
     loading = true;
     errorMessage = "";
+    progressMessages = [];
 
     try {
       const response = await fetch("/api/contribs", {
@@ -64,22 +71,115 @@
           repo: trimmedRepo,
           limit: contributorLimit,
         }),
+        signal: controller.signal,
       });
 
-      const payload = (await response.json()) as SummaryPayload & {
-        error?: string;
-      };
-
-      if (!response.ok) {
-        throw new Error(payload.error ?? "Unable to gather statistics.");
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("application/x-ndjson")) {
+        const fallback = await response
+          .json()
+          .catch(() => ({ error: null as string | null }));
+        const message =
+          fallback?.error ??
+          `Request failed with status ${response.status}. Please try again.`;
+        throw new Error(message);
       }
 
-      summary = payload;
+      if (!response.body) {
+        throw new Error("The server closed the connection unexpectedly.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let receivedResult = false;
+      let receivedError = false;
+
+      const appendStatus = (message: string) => {
+        if (!message) return;
+        const trimmed = message.trim();
+        if (!trimmed) return;
+        if (progressMessages[progressMessages.length - 1] === trimmed) {
+          return;
+        }
+        const next = [...progressMessages, trimmed];
+        const maxEntries = 20;
+        progressMessages =
+          next.length > maxEntries ? next.slice(next.length - maxEntries) : next;
+      };
+
+      const processLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        try {
+          const event = JSON.parse(trimmed) as
+            | { type: "status"; message: string }
+            | { type: "git"; command: string; stream: "stdout" | "stderr"; text: string }
+            | { type: "result"; summary: SummaryPayload }
+            | { type: "error"; message?: string };
+
+          if (event.type === "status") {
+            appendStatus(event.message);
+          } else if (event.type === "git") {
+            const label = `[${event.command}] ${event.text}`.trim();
+            appendStatus(label);
+          } else if (event.type === "result") {
+            summary = event.summary;
+            receivedResult = true;
+          } else if (event.type === "error") {
+            const message =
+              event.message ?? "Unable to gather statistics. Please retry later.";
+            errorMessage = message;
+            summary = null;
+            receivedError = true;
+          }
+        } catch (parseError) {
+          console.error("Failed to parse progress message", parseError, { line });
+        }
+      };
+
+      const processChunk = (chunk: string) => {
+        if (!chunk) return;
+        buffer += chunk;
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          processLine(line);
+          newlineIndex = buffer.indexOf("\n");
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          processChunk(decoder.decode(value, { stream: true }));
+        }
+      }
+
+      processChunk(decoder.decode());
+      if (buffer.trim()) {
+        processLine(buffer);
+        buffer = "";
+      }
+
+      if (!receivedResult && !receivedError) {
+        throw new Error("The server did not return any results.");
+      }
     } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
       errorMessage = (error as Error).message;
       summary = null;
     } finally {
-      loading = false;
+      if (activeController === controller) {
+        activeController = null;
+        loading = false;
+      }
     }
   }
 
@@ -131,6 +231,14 @@
 
     return period.label;
   }
+
+  function isAbortError(error: unknown): boolean {
+    return (
+      error instanceof DOMException
+        ? error.name === "AbortError"
+        : error instanceof Error && error.name === "AbortError"
+    );
+  }
 </script>
 
 <div class="page">
@@ -181,7 +289,11 @@
         <button type="submit" disabled={loading}>
           {#if loading}
             <span class="spinner" aria-hidden="true"></span>
-            <span>Analysing…</span>
+            <span>
+              {progressMessages.length
+                ? progressMessages[progressMessages.length - 1]
+                : "Working..."}
+            </span>
           {:else}
             <span>Generate chart</span>
           {/if}
@@ -199,6 +311,17 @@
         {/each}
       </div>
     </div>
+
+    {#if progressMessages.length > 0 && !summary}
+      <div class="progress">
+        <p>Progress updates</p>
+        <ul>
+          {#each progressMessages as message, index}
+            <li class:latest={index === progressMessages.length - 1}>{message}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
   </section>
 
   {#if errorMessage}
@@ -395,6 +518,35 @@
     display: grid;
     gap: 0.5rem;
     color: #555;
+  }
+
+  .progress {
+    background: #f1f5f9;
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    display: grid;
+    gap: 0.5rem;
+  }
+
+  .progress p {
+    margin: 0;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #1f2937;
+  }
+
+  .progress ul {
+    margin: 0;
+    padding-left: 1.1rem;
+    display: grid;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    color: #374151;
+  }
+
+  .progress li.latest {
+    color: #1d4ed8;
+    font-weight: 600;
   }
 
   .example-buttons {

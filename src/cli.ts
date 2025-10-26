@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { collectContributionSummary } from './lib/server/gitStats';
+import { collectContributionSummary, type ProgressEvent } from './lib/server/gitStats';
 import { renderContributionSvg } from './lib/server/svgChart';
 
 function printUsage(): void {
@@ -11,6 +11,16 @@ function printUsage(): void {
 
 function sanitizeFileName(slug: string, limit: number): string {
 	return `${slug.replace(/[\\/]/g, '--')}--top-${limit}.svg`;
+}
+
+function handleProgress(event: ProgressEvent): void {
+	if (event.type === 'status') {
+		console.log(event.message);
+		return;
+	}
+
+	const writer = event.stream === 'stderr' ? process.stderr : process.stdout;
+	writer.write(event.text);
 }
 
 async function main(): Promise<void> {
@@ -32,7 +42,7 @@ async function main(): Promise<void> {
 
 	try {
 		console.log(`Preparing statistics for ${slug} (top ${limit} contributors per interval)...`);
-		const summary = await collectContributionSummary(slug, limit);
+		const summary = await collectContributionSummary(slug, limit, { onProgress: handleProgress });
 		const intervalLabel = summary.interval === 'month' ? 'month' : 'year';
 		const svg = renderContributionSvg(summary, {
 			title: `Top ${limit} contributors per ${intervalLabel} for ${slug}`

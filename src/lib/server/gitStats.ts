@@ -13,6 +13,9 @@ import type {
 interface RunOptions {
 	cwd: string;
 	allowFailure?: boolean;
+	onStdout?: (chunk: string) => void;
+	onStderr?: (chunk: string) => void;
+	signal?: AbortSignal;
 }
 
 interface ContributorIdentity {
@@ -27,9 +30,29 @@ interface PeriodDefinition {
 	end: string;
 }
 
+export type ProgressEvent =
+	| { type: 'status'; message: string }
+	| { type: 'git'; command: string; stream: 'stdout' | 'stderr'; text: string };
+
+type ProgressCallback = (event: ProgressEvent) => void;
+
+export interface ContributionSummaryOptions {
+	onProgress?: ProgressCallback;
+	signal?: AbortSignal;
+}
+
 const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
 
 const GITHUB_BASE_URL = 'https://github.com';
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) {
+		return;
+	}
+	const abortError = new Error('The operation was aborted.');
+	abortError.name = 'AbortError';
+	throw abortError;
+}
 
 function parseSlug(slug: string): { owner: string; name: string } {
 	const [owner, name, ...rest] = slug.split('/');
@@ -53,7 +76,8 @@ async function runCommand(command: string, args: string[], options: RunOptions):
 			env: {
 				...process.env,
 				GIT_TERMINAL_PROMPT: '0'
-			}
+			},
+			signal: options.signal
 		});
 
 		let stdout = '';
@@ -64,10 +88,12 @@ async function runCommand(command: string, args: string[], options: RunOptions):
 
 		child.stdout?.on('data', (chunk) => {
 			stdout += chunk;
+			options.onStdout?.(chunk);
 		});
 
 		child.stderr?.on('data', (chunk) => {
 			stderr += chunk;
+			options.onStderr?.(chunk);
 		});
 
 		child.on('error', (error) => {
@@ -91,47 +117,98 @@ async function runCommand(command: string, args: string[], options: RunOptions):
 	});
 }
 
-async function ensureFullClone(repoPath: string): Promise<void> {
-	const fetchArgs = ['fetch', '--all', '--tags'];
-	await runCommand('git', fetchArgs, { cwd: repoPath });
+function createGitProgressHandlers(commandLabel: string, onProgress?: ProgressCallback): Pick<RunOptions, 'onStdout' | 'onStderr'> {
+	if (!onProgress) {
+		return {};
+	}
 
-	const isShallow = await runCommand('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoPath });
+	return {
+		onStdout: (chunk: string) => {
+			onProgress({ type: 'git', command: commandLabel, stream: 'stdout', text: chunk });
+		},
+		onStderr: (chunk: string) => {
+			onProgress({ type: 'git', command: commandLabel, stream: 'stderr', text: chunk });
+		}
+	};
+}
+
+async function ensureFullClone(
+	repoPath: string,
+	onProgress?: ProgressCallback,
+	signal?: AbortSignal
+): Promise<void> {
+	throwIfAborted(signal);
+	const fetchArgs = ['fetch', '--all', '--tags'];
+	onProgress?.({ type: 'status', message: 'Fetching remote references...' });
+	await runCommand('git', fetchArgs, {
+		cwd: repoPath,
+		...createGitProgressHandlers('git fetch --all --tags', onProgress),
+		signal
+	});
+
+	throwIfAborted(signal);
+	const isShallow = await runCommand('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoPath, signal });
 	if (isShallow === 'true') {
-		await runCommand('git', ['fetch', '--unshallow'], { cwd: repoPath });
+		onProgress?.({ type: 'status', message: 'Expanding shallow clone...' });
+		await runCommand('git', ['fetch', '--unshallow'], {
+			cwd: repoPath,
+			...createGitProgressHandlers('git fetch --unshallow', onProgress),
+			signal
+		});
 	}
 }
 
-async function initialiseRepository(slug: string): Promise<string> {
+async function initialiseRepository(slug: string, options?: ContributionSummaryOptions): Promise<string> {
+	throwIfAborted(options?.signal);
 	const repoPath = repoDirectoryForSlug(slug);
 	const baseDir = join(homedir(), 'git');
 	await mkdir(baseDir, { recursive: true });
 
 	if (!existsSync(repoPath)) {
 		const cloneUrl = `${GITHUB_BASE_URL}/${slug}.git`;
-		await runCommand('git', ['clone', '--no-tags', cloneUrl, repoPath], { cwd: baseDir });
+		options?.onProgress?.({ type: 'status', message: `Cloning ${slug} for the first time...` });
+		await runCommand('git', ['clone', '--no-tags', cloneUrl, repoPath], {
+			cwd: baseDir,
+			...createGitProgressHandlers(`git clone ${slug}`, options?.onProgress),
+			signal: options?.signal
+		});
+		options?.onProgress?.({ type: 'status', message: 'Clone complete.' });
 	}
 
-	await ensureFullClone(repoPath);
-	await runCommand('git', ['pull', '--ff-only'], { cwd: repoPath, allowFailure: true });
+	throwIfAborted(options?.signal);
+	await ensureFullClone(repoPath, options?.onProgress, options?.signal);
+	options?.onProgress?.({ type: 'status', message: 'Fast-forwarding to latest default branch...' });
+	await runCommand('git', ['pull', '--ff-only'], {
+		cwd: repoPath,
+		allowFailure: true,
+		...createGitProgressHandlers('git pull --ff-only', options?.onProgress),
+		signal: options?.signal
+	});
+	options?.onProgress?.({ type: 'status', message: 'Repository up to date.' });
 
 	return repoPath;
 }
 
-async function resolveCommitWindow(repoPath: string): Promise<{ firstCommit: Date; lastCommit: Date }> {
+async function resolveCommitWindow(
+	repoPath: string,
+	signal?: AbortSignal
+): Promise<{ firstCommit: Date; lastCommit: Date }> {
+	throwIfAborted(signal);
 	const latestCommitOutput = await runCommand(
 		'git',
 		['log', '--format=%ad', '--date=iso-strict', '--max-count=1'],
-		{ cwd: repoPath }
+		{ cwd: repoPath, signal }
 	);
 
 	if (!latestCommitOutput) {
 		throw new Error('No commits found in repository.');
 	}
 
+	throwIfAborted(signal);
 	const chronologicalOutput = await runCommand(
 		'git',
 		['log', '--format=%ad', '--date=iso-strict', '--reverse'],
-		{ cwd: repoPath }
+		{ cwd: repoPath, signal }
 	);
 
 	const earliestCommitOutput =
@@ -260,18 +337,31 @@ function determineInterval(firstCommit: Date, lastCommit: Date): AggregationInte
 	return duration < ONE_YEAR_MS ? 'month' : 'year';
 }
 
-export async function collectContributionSummary(slug: string, limit: number): Promise<RepoContributionSummary> {
+export async function collectContributionSummary(
+	slug: string,
+	limit: number,
+	options?: ContributionSummaryOptions
+): Promise<RepoContributionSummary> {
 	if (limit <= 0) {
 		throw new Error('The number of contributors to display must be greater than 0.');
 	}
 
-	const repoPath = await initialiseRepository(slug);
-	const { firstCommit, lastCommit } = await resolveCommitWindow(repoPath);
+	throwIfAborted(options?.signal);
+	options?.onProgress?.({ type: 'status', message: `Preparing repository data for ${slug}...` });
+	const repoPath = await initialiseRepository(slug, options);
+	throwIfAborted(options?.signal);
+	const { firstCommit, lastCommit } = await resolveCommitWindow(repoPath, options?.signal);
 	const interval = determineInterval(firstCommit, lastCommit);
 	const periodDefinitions =
 		interval === 'year'
 			? generateYearPeriods(firstCommit, lastCommit)
 			: generateMonthPeriods(firstCommit, lastCommit);
+
+	throwIfAborted(options?.signal);
+	options?.onProgress?.({
+		type: 'status',
+		message: `Calculating top ${limit} contributors per ${interval === 'year' ? 'year' : 'month'}`
+	});
 
 	const periods: RepoContributionSummary['periods'] = [];
 	const contributorMap = new Map<
@@ -279,7 +369,10 @@ export async function collectContributionSummary(slug: string, limit: number): P
 		{ commits: Map<string, number>; name: string; profileUrl?: string }
 	>();
 
-	for (const period of periodDefinitions) {
+	const progressStride = Math.max(1, Math.ceil(periodDefinitions.length / 10));
+
+	for (const [index, period] of periodDefinitions.entries()) {
+		throwIfAborted(options?.signal);
 		const output = await runCommand(
 			'git',
 			[
@@ -292,11 +385,17 @@ export async function collectContributionSummary(slug: string, limit: number): P
 				`--since=${period.start}`,
 				`--until=${period.end}`
 			],
-			{ cwd: repoPath }
+			{ cwd: repoPath, signal: options?.signal }
 		);
 
 		const contributors = parseShortlog(output, limit);
 		periods.push({ ...period, contributors });
+		if ((index + 1) % progressStride === 0 || index === periodDefinitions.length - 1) {
+			options?.onProgress?.({
+				type: 'status',
+				message: `Processed ${index + 1} of ${periodDefinitions.length} periods`
+			});
+		}
 
 		for (const { author, commits, profileUrl } of contributors) {
 			const contributorKey = profileUrl ?? author;
@@ -317,18 +416,20 @@ export async function collectContributionSummary(slug: string, limit: number): P
 
 	const series: ContributorSeries[] = Array.from(contributorMap.values())
 		.map((entry) => {
-		const { name, commits: periodMap, profileUrl } = entry;
-		const values = [];
-		let total = 0;
-		for (const period of periodDefinitions) {
-			const commits = periodMap.get(period.label) ?? 0;
-			total += commits;
-			values.push({ label: period.label, commits });
-		}
+			const { name, commits: periodMap, profileUrl } = entry;
+			const values = [];
+			let total = 0;
+			for (const period of periodDefinitions) {
+				const commits = periodMap.get(period.label) ?? 0;
+				total += commits;
+				values.push({ label: period.label, commits });
+			}
 
 			return { name, total, values, profileUrl };
 		})
 		.sort((a, b) => b.total - a.total);
+
+	options?.onProgress?.({ type: 'status', message: 'Contributor statistics ready.' });
 
 	return {
 		slug,
