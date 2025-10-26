@@ -26,8 +26,17 @@
   let loading = $state(false);
   let errorMessage = $state("");
   let summary = $state<SummaryPayload | null>(null);
-  let progressMessages = $state<string[]>([]);
+  interface ProgressEntry {
+    id: string;
+    message: string;
+    timestamp: number;
+    kind: "status" | "git";
+    command?: string;
+  }
+
+  let progressEntries = $state<ProgressEntry[]>([]);
   let activeController: AbortController | null = null;
+  const gitEntryLookup = new Map<string, string>();
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -60,7 +69,8 @@
 
     loading = true;
     errorMessage = "";
-    progressMessages = [];
+    progressEntries = [];
+    gitEntryLookup.clear();
 
     try {
       const response = await fetch("/api/contribs", {
@@ -95,17 +105,82 @@
       let receivedResult = false;
       let receivedError = false;
 
+      const MAX_ENTRIES = 20;
+
+      const appendEntry = (entry: ProgressEntry) => {
+        const next = [...progressEntries, entry];
+        progressEntries =
+          next.length > MAX_ENTRIES ? next.slice(next.length - MAX_ENTRIES) : next;
+      };
+
       const appendStatus = (message: string) => {
         if (!message) return;
         const trimmed = message.trim();
         if (!trimmed) return;
-        if (progressMessages[progressMessages.length - 1] === trimmed) {
+        const timestamp = Date.now();
+        const last = progressEntries[progressEntries.length - 1];
+        if (last && last.kind === "status" && last.message === trimmed) {
+          progressEntries = [
+            ...progressEntries.slice(0, -1),
+            { ...last, timestamp }
+          ];
           return;
         }
-        const next = [...progressMessages, trimmed];
-        const maxEntries = 20;
-        progressMessages =
-          next.length > maxEntries ? next.slice(next.length - maxEntries) : next;
+
+        appendEntry({
+          id: `${timestamp}-${Math.random()}`,
+          message: trimmed,
+          timestamp,
+          kind: "status"
+        });
+      };
+
+      const upsertGitEntry = (command: string, text: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+          return;
+        }
+
+        const timestamp = Date.now();
+        const label = `[${command}] ${trimmed}`;
+        const existingId = gitEntryLookup.get(command);
+        if (existingId) {
+          const existingEntry = progressEntries.find((entry) => entry.id === existingId);
+          if (!existingEntry) {
+            gitEntryLookup.delete(command);
+            const id = `${timestamp}-${Math.random()}`;
+            gitEntryLookup.set(command, id);
+            appendEntry({
+              id,
+              message: label,
+              timestamp,
+              kind: "git",
+              command
+            });
+            return;
+          }
+
+          const updatedEntry: ProgressEntry = {
+            ...existingEntry,
+            message: label,
+            timestamp
+          };
+
+          const filtered = progressEntries.filter((entry) => entry.id !== existingId);
+          const next = [...filtered, updatedEntry];
+          progressEntries = next.length > MAX_ENTRIES ? next.slice(next.length - MAX_ENTRIES) : next;
+          return;
+        }
+
+        const id = `${timestamp}-${Math.random()}`;
+        gitEntryLookup.set(command, id);
+        appendEntry({
+          id,
+          message: label,
+          timestamp,
+          kind: "git",
+          command
+        });
       };
 
       const processLine = (line: string) => {
@@ -121,8 +196,7 @@
           if (event.type === "status") {
             appendStatus(event.message);
           } else if (event.type === "git") {
-            const label = `[${event.command}] ${event.text}`.trim();
-            appendStatus(label);
+            upsertGitEntry(event.command, event.text);
           } else if (event.type === "result") {
             summary = event.summary;
             receivedResult = true;
@@ -239,6 +313,15 @@
         : error instanceof Error && error.name === "AbortError"
     );
   }
+
+  function formatTimestamp(value: number): string {
+    const date = new Date(value);
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    }).format(date);
+  }
 </script>
 
 <div class="page">
@@ -290,8 +373,8 @@
           {#if loading}
             <span class="spinner" aria-hidden="true"></span>
             <span>
-              {progressMessages.length
-                ? progressMessages[progressMessages.length - 1]
+              {progressEntries.length
+                ? progressEntries[progressEntries.length - 1].message
                 : "Working..."}
             </span>
           {:else}
@@ -312,12 +395,15 @@
       </div>
     </div>
 
-    {#if progressMessages.length > 0 && !summary}
+    {#if progressEntries.length > 0 && !summary}
       <div class="progress">
         <p>Progress updates</p>
         <ul>
-          {#each progressMessages as message, index}
-            <li class:latest={index === progressMessages.length - 1}>{message}</li>
+          {#each progressEntries as entry, index}
+            <li class:latest={index === progressEntries.length - 1}>
+              <span class="timestamp">{formatTimestamp(entry.timestamp)}</span>
+              <span>{entry.message}</span>
+            </li>
           {/each}
         </ul>
       </div>
@@ -547,6 +633,18 @@
   .progress li.latest {
     color: #1d4ed8;
     font-weight: 600;
+  }
+
+  .progress li {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+  }
+
+  .timestamp {
+    font-variant-numeric: tabular-nums;
+    color: #1f2937;
+    opacity: 0.7;
   }
 
   .example-buttons {
