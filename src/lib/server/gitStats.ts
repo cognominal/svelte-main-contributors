@@ -138,7 +138,7 @@ async function ensureFullClone(
 	signal?: AbortSignal
 ): Promise<void> {
 	throwIfAborted(signal);
-	const fetchArgs = ['fetch', '--all', '--tags'];
+	const fetchArgs = ['fetch', '--progress', '--all', '--tags'];
 	onProgress?.({ type: 'status', message: 'Fetching remote references...' });
 	await runCommand('git', fetchArgs, {
 		cwd: repoPath,
@@ -150,7 +150,7 @@ async function ensureFullClone(
 	const isShallow = await runCommand('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoPath, signal });
 	if (isShallow === 'true') {
 		onProgress?.({ type: 'status', message: 'Expanding shallow clone...' });
-		await runCommand('git', ['fetch', '--unshallow'], {
+		await runCommand('git', ['fetch', '--progress', '--unshallow'], {
 			cwd: repoPath,
 			...createGitProgressHandlers('git fetch --unshallow', onProgress),
 			signal
@@ -167,7 +167,7 @@ async function initialiseRepository(slug: string, options?: ContributionSummaryO
 	if (!existsSync(repoPath)) {
 		const cloneUrl = `${GITHUB_BASE_URL}/${slug}.git`;
 		options?.onProgress?.({ type: 'status', message: `Cloning ${slug} for the first time...` });
-		await runCommand('git', ['clone', '--no-tags', cloneUrl, repoPath], {
+		await runCommand('git', ['clone', '--progress', '--no-tags', cloneUrl, repoPath], {
 			cwd: baseDir,
 			...createGitProgressHandlers(`git clone ${slug}`, options?.onProgress),
 			signal: options?.signal
@@ -178,7 +178,7 @@ async function initialiseRepository(slug: string, options?: ContributionSummaryO
 	throwIfAborted(options?.signal);
 	await ensureFullClone(repoPath, options?.onProgress, options?.signal);
 	options?.onProgress?.({ type: 'status', message: 'Fast-forwarding to latest default branch...' });
-	await runCommand('git', ['pull', '--ff-only'], {
+	await runCommand('git', ['pull', '--progress', '--ff-only'], {
 		cwd: repoPath,
 		allowFailure: true,
 		...createGitProgressHandlers('git pull --ff-only', options?.onProgress),
