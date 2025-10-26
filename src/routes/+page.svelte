@@ -20,12 +20,12 @@
     }>;
   }
 
-  let owner = "";
-  let repo = "";
-  let limit = 5;
-  let loading = false;
-  let errorMessage = "";
-  let summary: SummaryPayload | null = null;
+  let owner = $state("");
+  let repo = $state("");
+  let limit = $state(5);
+  let loading = $state(false);
+  let errorMessage = $state("");
+  let summary = $state<SummaryPayload | null>(null);
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -35,7 +35,8 @@
     { owner: "deepseek-ai", repo: "DeepSeek-R1" },
   ];
 
-  async function handleSubmit() {
+  async function handleSubmit(event?: SubmitEvent) {
+    event?.preventDefault();
     const trimmedOwner = owner.trim();
     const trimmedRepo = repo.trim();
     const contributorLimit = Number(limit);
@@ -142,7 +143,7 @@
   </header>
 
   <section class="controls">
-    <form on:submit|preventDefault={handleSubmit}>
+    <form onsubmit={handleSubmit}>
       <div class="field">
         <label for="owner">Owner</label>
         <input
@@ -192,11 +193,7 @@
       <p>Try one of these featured repositories:</p>
       <div class="example-buttons">
         {#each examples as example}
-          <button
-            type="button"
-            on:click={() => useExample(example)}
-            disabled={loading}
-          >
+          <button type="button" onclick={() => useExample(example)} disabled={loading}>
             {example.owner}/{example.repo}
           </button>
         {/each}

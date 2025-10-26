@@ -16,12 +16,23 @@
 		'#17becf'
 	];
 
-	export let series: ContributorSeries[] = [];
-	export let periods: Array<{ label: string; start: string; end: string }> = [];
-	export let interval: 'year' | 'month' = 'year';
-	export let width = 960;
-	export let height = 540;
-	export let loading = false;
+	type Period = { label: string; start: string; end: string };
+
+	const {
+		series = [],
+		periods = [],
+		interval = 'year',
+		width = 960,
+		height = 540,
+		loading = false
+	} = $props<{
+		series?: ContributorSeries[];
+		periods?: Period[];
+		interval?: 'year' | 'month';
+		width?: number;
+		height?: number;
+		loading?: boolean;
+	}>();
 
 	const margin = { top: 56, right: 240, bottom: 56, left: 80 };
 
@@ -36,72 +47,107 @@
 		return label;
 	}
 
-	$: hasData = series.length > 0 && periods.length > 0;
+	const hasData = $derived(series.length > 0 && periods.length > 0);
 
-	$: periodLabels = hasData ? periods.map((period) => period.label) : [];
+	const periodLabels = $derived(
+		hasData ? periods.map((period: Period) => period.label) : []
+	);
 
-	$: filteredSeries = series.filter((item) => item.values.some((value) => value.commits > 0));
+	const filteredSeries = $derived(
+		series.filter((item: ContributorSeries) =>
+			item.values.some((value: ContributorSeries['values'][number]) => value.commits > 0)
+		)
+	);
 
-	$: maxCommits =
+	const maxCommits = $derived(
 		filteredSeries.length > 0
 			? Math.max(
 					1,
-					...filteredSeries.map((item) =>
-						item.values.reduce((highest, value) => Math.max(highest, value.commits), 0)
+					...filteredSeries.map((item: ContributorSeries) =>
+						item.values.reduce(
+							(highest: number, value: ContributorSeries['values'][number]) =>
+								Math.max(highest, value.commits),
+							0
+						)
 					)
 				)
-			: 1;
+			: 1
+	);
 
-	$: chartWidth = width - margin.left - margin.right;
-	$: chartHeight = height - margin.top - margin.bottom;
+	const chartWidth = $derived(width - margin.left - margin.right);
+	const chartHeight = $derived(height - margin.top - margin.bottom);
 
-	$: xScale = scalePoint<string>()
-		.domain(periodLabels)
-		.range([margin.left, margin.left + chartWidth])
-		.padding(0.5);
+	const xScale = $derived(
+		scalePoint<string>()
+			.domain(periodLabels)
+			.range([margin.left, margin.left + chartWidth])
+			.padding(0.5)
+	);
 
-	$: yScale = scaleLinear()
-		.domain([0, maxCommits])
-		.nice()
-		.range([margin.top + chartHeight, margin.top]);
+	const yScale = $derived(
+		scaleLinear()
+			.domain([0, maxCommits])
+			.nice()
+			.range([margin.top + chartHeight, margin.top])
+	);
 
-	$: lineGenerator = line<{ label: string; commits: number }>()
-		.curve(curveMonotoneX)
-		.defined((d) => Number.isFinite(d.commits) && Number.isFinite(xScale(d.label) ?? Number.NaN))
-		.x((d) => xScale(d.label) ?? margin.left)
-		.y((d) => yScale(d.commits));
+	const lineGenerator = $derived(
+		line<{ label: string; commits: number }>()
+			.curve(curveMonotoneX)
+			.defined(
+				(d) =>
+					Number.isFinite(d.commits) && Number.isFinite(xScale(d.label) ?? Number.NaN)
+			)
+			.x((d) => xScale(d.label) ?? margin.left)
+			.y((d) => yScale(d.commits))
+	);
 
-	$: chartSeries = filteredSeries.map((item, index) => {
-		const color = PALETTE[index % PALETTE.length];
-		const valueByLabel = new Map(item.values.map((value) => [value.label, value.commits]));
-		const values = periodLabels.map((label) => ({
-			label,
-			commits: valueByLabel.get(label) ?? 0
-		}));
+	type ChartSeries = {
+		name: string;
+		total: number;
+		color: string;
+		path: string;
+		points: Array<{ label: string; commits: number; x: number; y: number }>;
+	};
 
-		return {
-			name: item.name,
-			total: item.total,
-			color,
-			path: lineGenerator(values) ?? '',
-			points: values.map((value) => ({
-				...value,
-				x: xScale(value.label) ?? margin.left,
-				y: yScale(value.commits)
-			}))
-		};
-	});
+	const chartSeries = $derived<ChartSeries[]>(
+		filteredSeries.map((item: ContributorSeries, index: number) => {
+			const color = PALETTE[index % PALETTE.length];
+			const valueByLabel = new Map(
+				item.values.map((value: ContributorSeries['values'][number]) => [
+					value.label,
+					value.commits
+				])
+			);
+			const values = periodLabels.map((label: string) => ({
+				label,
+				commits: valueByLabel.get(label) ?? 0
+			}));
 
-	$: xTicks = (() => {
+			return {
+				name: item.name,
+				total: item.total,
+				color,
+				path: lineGenerator(values) ?? '',
+				points: values.map((value: { label: string; commits: number }) => ({
+					...value,
+					x: xScale(value.label) ?? margin.left,
+					y: yScale(value.commits)
+				}))
+			};
+		})
+	);
+
+	const xTicks = $derived.by<string[]>(() => {
 		if (periodLabels.length <= 12) {
 			return periodLabels;
 		}
 
 		const step = Math.ceil(periodLabels.length / 12);
-		return periodLabels.filter((_, index) => index % step === 0);
-	})();
+		return periodLabels.filter((_: string, index: number) => index % step === 0);
+	});
 
-	$: yTicks = yScale.ticks(6);
+	const yTicks = $derived(yScale.ticks(6));
 </script>
 
 {#if loading}
