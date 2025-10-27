@@ -59,6 +59,12 @@
   let ownerFieldEl: HTMLDivElement | null = null;
   let repoFieldEl: HTMLDivElement | null = null;
   let repoValidationState = $state<"idle" | "pending" | "valid" | "invalid">("idle");
+  let chartCardElements = $state<Array<HTMLElement | null>>([]);
+  let thumbnailUrls = $state<Array<string | null>>([]);
+  let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>([]);
+  let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number } | null>(null);
+  let storageStatus = $state<"idle" | "loading" | "error" | "ready">("idle");
+  let storageError = $state<string | null>(null);
   const GITHUB_BASE_URL = "https://github.com";
   let ownerSuggestionAbort: AbortController | null = null;
   let repoSuggestionAbort: AbortController | null = null;
@@ -298,12 +304,20 @@
               };
               summaries = nextSummaries;
               descriptions = nextDescriptions;
+              const nextThumbs = [...thumbnailUrls];
+              nextThumbs[targetIndex] = null;
+              thumbnailUrls = nextThumbs;
+              const nextStatuses = [...thumbnailStatus];
+              nextStatuses[targetIndex] = "idle";
+              thumbnailStatus = nextStatuses;
               selectedIndex = targetIndex;
               scrollToCard(targetIndex, "auto").catch(() => {});
             }
           } else if (event.type === "complete") {
             summaries = event.summaries ?? [];
             descriptions = (event.summaries ?? []).map((entry) => entry.description ?? undefined);
+            thumbnailUrls = new Array(summaries.length).fill(null);
+            thumbnailStatus = new Array(summaries.length).fill("idle");
             receivedComplete = true;
             batchStatus = null;
             if (summaries.length > 0 && selectedIndex >= summaries.length) {
@@ -313,6 +327,8 @@
           } else if (event.type === "result") {
             summaries = [event.summary];
             descriptions = [event.summary.description ?? undefined];
+            thumbnailUrls = [null];
+            thumbnailStatus = ["idle"];
             selectedIndex = 0;
             receivedComplete = true;
             batchStatus = null;
@@ -323,6 +339,8 @@
             errorMessage = message;
             summaries = [];
             descriptions = [];
+            thumbnailUrls = [];
+            thumbnailStatus = [];
             batchStatus = null;
             receivedError = true;
           }
@@ -506,6 +524,42 @@
     }
   });
 
+  $effect(() => {
+    const count = filteredSummaries.length;
+    if (chartCardElements.length !== count) {
+      const nextCards = [...chartCardElements];
+      nextCards.length = count;
+      for (let index = 0; index < count; index += 1) {
+        if (!(index in nextCards)) {
+          nextCards[index] = null;
+        }
+      }
+      chartCardElements = nextCards;
+    }
+
+    if (thumbnailUrls.length !== count) {
+      const nextUrls = [...thumbnailUrls];
+      nextUrls.length = count;
+      for (let index = 0; index < count; index += 1) {
+        if (!(index in nextUrls)) {
+          nextUrls[index] = null;
+        }
+      }
+      thumbnailUrls = nextUrls;
+    }
+
+    if (thumbnailStatus.length !== count) {
+      const nextStatus = [...thumbnailStatus];
+      nextStatus.length = count;
+      for (let index = 0; index < count; index += 1) {
+        if (!(index in nextStatus)) {
+          nextStatus[index] = "idle";
+        }
+      }
+      thumbnailStatus = nextStatus;
+    }
+  });
+
   async function scrollToCard(index: number, behavior: ScrollBehavior = "smooth") {
     if (!chartStrip) {
       return;
@@ -591,9 +645,6 @@
     if (!chartStrip || event.button !== 0) {
       return;
     }
-    if (event.pointerType !== "mouse" && event.pointerType !== "pen") {
-      return;
-    }
     pointerDrag = {
       id: event.pointerId,
       startX: event.clientX,
@@ -621,6 +672,112 @@
     pointerDrag = null;
     pointerDragging = false;
   }
+
+  async function captureThumbnail(index: number) {
+    const host = chartCardElements[index];
+    if (!host) {
+      return;
+    }
+    const svg = host.querySelector("svg");
+    if (!(svg instanceof SVGElement)) {
+      return;
+    }
+
+    const bbox = svg.getBoundingClientRect();
+    const viewBox = svg.viewBox?.baseVal;
+    const sourceWidth =
+      (viewBox && viewBox.width > 0 ? viewBox.width : bbox.width) || svg.clientWidth || 800;
+    const sourceHeight =
+      (viewBox && viewBox.height > 0 ? viewBox.height : bbox.height) || svg.clientHeight || 400;
+
+    if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
+      thumbnailStatus = thumbnailStatus.map((status, idx) =>
+        idx === index ? "error" : status
+      );
+      return;
+    }
+
+    const scale = Math.min(1, 240 / sourceWidth);
+    const targetWidth = Math.max(1, Math.round(sourceWidth * scale));
+    const targetHeight = Math.max(1, Math.round(sourceHeight * scale));
+
+    const clone = svg.cloneNode(true) as SVGElement;
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    if (!clone.getAttribute("viewBox")) {
+      clone.setAttribute("viewBox", `0 0 ${sourceWidth} ${sourceHeight}`);
+    }
+    clone.setAttribute("width", `${sourceWidth}`);
+    clone.setAttribute("height", `${sourceHeight}`);
+
+    const backgroundColor = resolveBackgroundColor(host);
+    const background = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    background.setAttribute("x", "0");
+    background.setAttribute("y", "0");
+    background.setAttribute("width", `${sourceWidth}`);
+    background.setAttribute("height", `${sourceHeight}`);
+    background.setAttribute("fill", backgroundColor);
+    clone.insertBefore(background, clone.firstChild);
+
+    const serializer = new XMLSerializer();
+    const source = serializer.serializeToString(clone);
+    const svgBlob = new Blob([source], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(svgBlob);
+    try {
+      const image = new Image();
+      image.decoding = "async";
+      image.crossOrigin = "anonymous";
+      const loadPromise = new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = (event) => reject(new Error("Unable to render SVG thumbnail."));
+      });
+      image.src = url;
+      await loadPromise;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        throw new Error("Canvas context unavailable.");
+      }
+    context.fillStyle = backgroundColor;
+      context.fillRect(0, 0, targetWidth, targetHeight);
+      context.scale(scale, scale);
+      context.drawImage(image, 0, 0, sourceWidth, sourceHeight);
+      const dataUrl = canvas.toDataURL("image/png");
+
+      const nextUrls = [...thumbnailUrls];
+      nextUrls[index] = dataUrl;
+      thumbnailUrls = nextUrls;
+
+      const nextStatus = [...thumbnailStatus];
+      nextStatus[index] = "ready";
+      thumbnailStatus = nextStatus;
+    } catch (error) {
+      const nextStatus = [...thumbnailStatus];
+      nextStatus[index] = "error";
+      thumbnailStatus = nextStatus;
+      console.error("Failed to capture thumbnail", error);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  $effect(() => {
+    filteredSummaries;
+    chartCardElements;
+    (async () => {
+      await tick();
+      for (let index = 0; index < filteredSummaries.length; index += 1) {
+        if (thumbnailStatus[index] === "idle" && chartCardElements[index]) {
+          const nextStatus = [...thumbnailStatus];
+          nextStatus[index] = "pending";
+          thumbnailStatus = nextStatus;
+          await captureThumbnail(index);
+        }
+      }
+    })().catch((error) => console.error(error));
+  });
 
   function handlePointerUp(event: PointerEvent) {
     endPointerDrag(event);
@@ -955,6 +1112,87 @@
     }
   }
 
+  function repositoryName(slug: string): string {
+    const parts = slug.split("/");
+    return parts.length > 1 ? parts[1] : slug;
+  }
+
+  function resolveBackgroundColor(element: HTMLElement | null): string {
+    let current: HTMLElement | null = element;
+    while (current) {
+      const color = getComputedStyle(current).backgroundColor;
+      if (color && color !== "rgba(0, 0, 0, 0)" && color !== "transparent") {
+        return color;
+      }
+      current = current.parentElement;
+    }
+    return "#ffffff";
+  }
+
+  function formatBytes(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) {
+      return "0B";
+    }
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const exponent = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+    const scaled = value / 1024 ** exponent;
+    const display = scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(1);
+    return `${display}${units[exponent]}`;
+  }
+
+  async function loadStorageInfo() {
+    if (storageStatus === "loading") {
+      return;
+    }
+    storageStatus = "loading";
+    storageError = null;
+    try {
+      const response = await fetch("/api/storage");
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`);
+      }
+      const data = (await response.json()) as {
+        gitBytes: number;
+        usedBytes: number;
+        totalBytes: number;
+      };
+      storageInfo = data;
+      storageStatus = "ready";
+    } catch (error) {
+      storageStatus = "error";
+      storageError = error instanceof Error ? error.message : "Unable to load storage information.";
+    }
+  }
+
+  function chartRef(node: HTMLElement, index: number) {
+    let currentIndex = index;
+    const next = [...chartCardElements];
+    next[currentIndex] = node;
+    chartCardElements = next;
+
+    return {
+      destroy() {
+        const updated = [...chartCardElements];
+        if (updated[currentIndex] === node) {
+          updated[currentIndex] = null;
+          chartCardElements = updated;
+        }
+      },
+      update(nextIndex: number) {
+        if (nextIndex === currentIndex) {
+          return;
+        }
+        const updated = [...chartCardElements];
+        if (updated[currentIndex] === node) {
+          updated[currentIndex] = null;
+        }
+        updated[nextIndex] = node;
+        chartCardElements = updated;
+        currentIndex = nextIndex;
+      }
+    };
+  }
+
   async function validateOwner(login: string): Promise<boolean> {
     if (!login.trim()) {
       ownerValidationState = "idle";
@@ -1034,6 +1272,7 @@
   }
 
   onMount(() => {
+    void loadStorageInfo();
     const handleGlobalPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (
@@ -1181,6 +1420,17 @@
           <span>Hide bot accounts</span>
       </label>
     </div>
+    <p class="storage-info">
+      {#if storageStatus === "ready" && storageInfo}
+        <span>{formatBytes(storageInfo.gitBytes)} / {formatBytes(storageInfo.totalBytes)}</span>
+      {:else if storageStatus === "loading"}
+        <span>Checking storage…</span>
+      {:else if storageStatus === "error" && storageError}
+        <span class="storage-info__error">{storageError}</span>
+      {:else}
+        <span>Storage info unavailable</span>
+      {/if}
+    </p>
     {#if batchStatus}
       <p class="batch-status" aria-live="polite">
         Handling <code>{batchStatus.slug}</code> {batchStatus.current}/{batchStatus.total}
@@ -1251,9 +1501,15 @@
         ontouchmove={handleTouchMove}
         ontouchend={handleTouchEnd}
         ontouchcancel={handleTouchEnd}
+        role="application"
+        aria-label="Chart strip"
       >
         {#each filteredSummaries as item, index}
-          <article class="chart-card" class:active={index === selectedIndex}>
+          <article
+            class="chart-card"
+            class:active={index === selectedIndex}
+            use:chartRef={index}
+          >
             <header class="chart-card__header">
               <span class="chart-card__index">{index + 1}/{filteredSummaries.length}</span>
               <span class="chart-card__slug">{item.slug}</span>
@@ -1280,6 +1536,34 @@
   </section>
   {#if filteredSummaries.length > 1}
     <p class="chart-hint">Swipe horizontally or use trackpad scroll to pan between charts.</p>
+  {/if}
+
+  {#if filteredSummaries.length > 0}
+    <div class="thumbnail-strip" aria-label="Chart thumbnails">
+      {#each filteredSummaries as summary, index}
+        <button
+          type="button"
+          class="thumbnail"
+          class:active={index === selectedIndex}
+          onclick={() => {
+            selectedIndex = index;
+            requestAnimationFrame(() => {
+              scrollToCard(index).catch(() => {});
+            });
+          }}
+          aria-label={`Show ${summary.slug}`}
+        >
+          <span class="thumbnail__label">{repositoryName(summary.slug)}</span>
+          {#if thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
+            <img src={thumbnailUrls[index] ?? ""} alt={`Preview of ${summary.slug}`} />
+          {:else if thumbnailStatus[index] === "pending"}
+            <span class="thumbnail__placeholder">Rendering…</span>
+          {:else}
+            <span class="thumbnail__placeholder">Preview unavailable</span>
+          {/if}
+        </button>
+      {/each}
+    </div>
   {/if}
 
   {#if activeSummary}
@@ -1441,6 +1725,16 @@
   .field--checkbox input[type="checkbox"] {
     width: 1.1rem;
     height: 1.1rem;
+  }
+
+  .storage-info {
+    margin-top: 0.25rem;
+    font-size: 0.85rem;
+    color: #475569;
+  }
+
+  .storage-info__error {
+    color: #b91c1c;
   }
 
   input:focus {
@@ -1622,6 +1916,74 @@
 
   .chart-strip.dragging * {
     user-select: none;
+  }
+
+  .thumbnail-strip {
+    margin: 1rem 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .thumbnail {
+    position: relative;
+    width: 9.5rem;
+    height: 6rem;
+    border: none;
+    border-radius: 0.75rem;
+    padding: 0;
+    overflow: hidden;
+    background: #f8fafc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, border 0.15s ease;
+    border: 2px solid transparent;
+  }
+
+  .thumbnail:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 20px rgba(15, 23, 42, 0.18);
+  }
+
+  .thumbnail.active {
+    border-color: #2563eb;
+    box-shadow: 0 10px 24px rgba(37, 99, 235, 0.25);
+  }
+
+  .thumbnail img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    background: #f8fafc;
+  }
+
+  .thumbnail__label {
+    position: absolute;
+    top: 0.3rem;
+    left: 0.4rem;
+    right: 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #0f172a;
+    background: rgba(255, 255, 255, 0.85);
+    border-radius: 999px;
+    padding: 0.2rem 0.5rem;
+    text-align: center;
+    pointer-events: none;
+    backdrop-filter: blur(2px);
+  }
+
+  .thumbnail__placeholder {
+    font-size: 0.75rem;
+    color: #475569;
+    text-align: center;
+    padding: 0 0.5rem;
+    margin-top: 1.5rem;
+    background: rgba(248, 250, 252, 0.9);
+    border-radius: 0.5rem;
   }
 
   .chart-card {

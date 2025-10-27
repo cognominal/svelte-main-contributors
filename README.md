@@ -36,3 +36,17 @@ The CLI syncs the repository, aggregates commits, and saves an SVG named like `o
 ## Environment
 - Set `VITE_GITHUB_TOKEN` (optional) to raise API rate limits for owner/repository auto-complete and top-starred batch syncing.
 - UI code uses modern Svelte event attributes (`onclick`, `onmouseenter`, ...). Avoid the deprecated `on:` syntax when adding handlers.
+
+## Docker
+
+Build a production image:
+
+```bash
+docker build -t contribs .
+```
+
+Run it (the preview server listens on port 4173):
+
+```bash
+docker run --rm -p 4173:4173 contribs
+```
