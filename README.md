@@ -15,6 +15,13 @@ bun install
 - `bun run build` &mdash; produce a production build
 - `bun run preview` &mdash; preview the production build locally
 
+Giving a correct repo owner and typing enter will clone or update, and display the SVGs for the 5 most starred 
+repositories for that owner.
+Given a owner, selecting a repo and  typing enter displays the SVG for that sole repo.
+You can scroll horizontally between them.
+Hovering over a user name will highlight the curve for him.
+
+
 ## CLI
 Generate a contribution chart for a GitHub repository:
 ```bash
@@ -26,3 +33,6 @@ The CLI syncs the repository, aggregates commits, and saves an SVG named like `o
 ## Checks
 - `bun run check` &mdash; run SvelteKit's type and accessibility checks
 
+## Environment
+- Set `VITE_GITHUB_TOKEN` (optional) to raise API rate limits for owner/repository auto-complete and top-starred batch syncing.
+- UI code uses modern Svelte event attributes (`onclick`, `onmouseenter`, ...). Avoid the deprecated `on:` syntax when adding handlers.

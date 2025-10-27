@@ -97,12 +97,11 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	let manualSlug: string | null = null;
-	if (topStarred) {
-		if (!owner) {
-			return json({ error: 'Owner is required to load top starred repositories.' }, { status: 400 });
-		}
-	} else {
-		if (!owner || !repo) {
+	if (!owner) {
+		return json({ error: 'Owner is required.' }, { status: 400 });
+	}
+	if (!topStarred) {
+		if (!repo) {
 			return json({ error: 'Both owner and repository are required.' }, { status: 400 });
 		}
 		manualSlug = `${owner}/${repo}`;

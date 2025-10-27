@@ -1,7 +1,7 @@
 <script lang="ts">
   import ContributionChart from "$lib/components/ContributionChart.svelte";
   import { fade } from "svelte/transition";
-  import { tick } from "svelte";
+  import { tick, onMount } from "svelte";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
 
   interface SummaryPayload {
@@ -41,17 +41,33 @@
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
   let highlightedContributor = $state<string | null>(null);
-  let includeTopStarred = $state(false);
   let excludeBots = $state(true);
   let chartStrip = $state<HTMLDivElement | null>(null);
+  let pointerDragging = $state(false);
+  let pointerDrag: { id: number; startX: number; scrollLeft: number } | null = null;
   let batchStatus = $state<{ slug: string; current: number; total: number } | null>(null);
   let descriptions = $state<Array<string | undefined>>([]);
-  const topStarredLabel = $derived(
-    owner.trim().length
-      ? `Use ${owner.trim()}'s top starred repos`
-      : "Use owner's top starred repos"
-  );
+  let ownerSuggestions = $state<string[]>([]);
+  let ownerSuggestionNote = $state<string | null>(null);
+  let ownerSuggestionIndex = $state(-1);
+  let ownerValidationState = $state<"idle" | "pending" | "valid" | "invalid">("idle");
+  let repoSuggestions = $state<string[]>([]);
+  let repoSuggestionNote = $state<string | null>(null);
+  let repoSuggestionIndex = $state(-1);
+  let ownerInputEl: HTMLInputElement | null = null;
+  let repoInputEl: HTMLInputElement | null = null;
+  let ownerFieldEl: HTMLDivElement | null = null;
+  let repoFieldEl: HTMLDivElement | null = null;
+  let repoValidationState = $state<"idle" | "pending" | "valid" | "invalid">("idle");
   const GITHUB_BASE_URL = "https://github.com";
+  let ownerSuggestionAbort: AbortController | null = null;
+  let repoSuggestionAbort: AbortController | null = null;
+  let ownerValidationAbort: AbortController | null = null;
+  let repoValidationAbort: AbortController | null = null;
+  let ownerSuggestionDebounce: ReturnType<typeof setTimeout> | undefined;
+  let ownerValidationDebounce: ReturnType<typeof setTimeout> | undefined;
+  let repoSuggestionDebounce: ReturnType<typeof setTimeout> | undefined;
+  let repoValidationDebounce: ReturnType<typeof setTimeout> | undefined;
 
   const examples = [
     { owner: "torvalds", repo: "linux" },
@@ -64,11 +80,34 @@
     event?.preventDefault();
     const trimmedOwner = owner.trim();
     const trimmedRepo = repo.trim();
+    const topStarred = trimmedRepo.length === 0;
     const contributorLimit = Number(limit);
 
+    if (!trimmedOwner) {
+      errorMessage =
+        "Please provide a valid owner, repository, and contributor count.";
+      return;
+    }
+
+    if (ownerValidationState !== "valid") {
+      const ownerOk = await validateOwner(trimmedOwner);
+      if (!ownerOk) {
+        errorMessage =
+          "Please provide a valid owner, repository, and contributor count.";
+        return;
+      }
+    }
+
+    if (!topStarred && repoValidationState !== "valid") {
+      const repoOk = await validateRepo(trimmedOwner, trimmedRepo);
+      if (!repoOk) {
+        errorMessage =
+          "Please provide a valid owner, repository, and contributor count.";
+        return;
+      }
+    }
+
     if (
-      (includeTopStarred && !trimmedOwner) ||
-      (!includeTopStarred && (!trimmedOwner || !trimmedRepo)) ||
       !Number.isFinite(contributorLimit) ||
       contributorLimit <= 0
     ) {
@@ -86,6 +125,12 @@
     progressEntries = [];
     gitEntryLookup.clear();
     highlightedContributor = null;
+    ownerSuggestions = [];
+    ownerSuggestionNote = null;
+    repoSuggestions = [];
+    repoSuggestionNote = null;
+    ownerSuggestionIndex = -1;
+    repoSuggestionIndex = -1;
     summaries = [];
     selectedIndex = 0;
     batchStatus = null;
@@ -101,7 +146,7 @@
           repo: trimmedRepo,
           limit: contributorLimit,
           excludeBots: false,
-          topStarred: includeTopStarred
+          topStarred
         }),
         signal: controller.signal,
       });
@@ -333,13 +378,28 @@
   }
 
   function useExample(repoExample: { owner: string; repo: string }) {
-    includeTopStarred = false;
     owner = repoExample.owner;
     repo = repoExample.repo;
+    ownerValidationState = "valid";
+    ownerValidationAbort?.abort();
+    if (ownerValidationDebounce) {
+      clearTimeout(ownerValidationDebounce);
+      ownerValidationDebounce = undefined;
+    }
+    repoValidationAbort?.abort();
+    if (repoValidationDebounce) {
+      clearTimeout(repoValidationDebounce);
+      repoValidationDebounce = undefined;
+    }
+    repoValidationState = "valid";
     batchStatus = null;
     progressEntries = [];
     gitEntryLookup.clear();
     descriptions = [];
+    ownerSuggestions = [];
+    ownerSuggestionNote = null;
+    repoSuggestions = [];
+    repoSuggestionNote = null;
     void handleSubmit();
   }
 
@@ -424,6 +484,7 @@
     return { ...source, periods, series };
   }
 
+  const ownerIsValid = $derived(ownerValidationState === "valid");
   const filteredSummaries = $derived(
     summaries.map((entry) => filterBots(entry, excludeBots))
   );
@@ -525,6 +586,476 @@
       delete chartStrip.dataset.prevTouchX;
     }
   }
+
+  function handlePointerDown(event: PointerEvent) {
+    if (!chartStrip || event.button !== 0) {
+      return;
+    }
+    if (event.pointerType !== "mouse" && event.pointerType !== "pen") {
+      return;
+    }
+    pointerDrag = {
+      id: event.pointerId,
+      startX: event.clientX,
+      scrollLeft: chartStrip.scrollLeft
+    };
+    chartStrip.setPointerCapture?.(event.pointerId);
+    pointerDragging = true;
+    event.preventDefault();
+  }
+
+  function handlePointerMove(event: PointerEvent) {
+    if (!chartStrip || !pointerDrag || event.pointerId !== pointerDrag.id) {
+      return;
+    }
+    event.preventDefault();
+    const delta = event.clientX - pointerDrag.startX;
+    chartStrip.scrollLeft = pointerDrag.scrollLeft - delta;
+  }
+
+  function endPointerDrag(event: PointerEvent) {
+    if (!chartStrip || !pointerDrag || event.pointerId !== pointerDrag.id) {
+      return;
+    }
+    chartStrip.releasePointerCapture?.(event.pointerId);
+    pointerDrag = null;
+    pointerDragging = false;
+  }
+
+  function handlePointerUp(event: PointerEvent) {
+    endPointerDrag(event);
+  }
+
+  function handlePointerLeave(event: PointerEvent) {
+    endPointerDrag(event);
+  }
+
+  function handlePointerCancel(event: PointerEvent) {
+    endPointerDrag(event);
+  }
+
+  function abortOwnerSuggestions() {
+    ownerSuggestionAbort?.abort();
+    ownerSuggestionAbort = null;
+  }
+
+  function abortRepoSuggestions() {
+    repoSuggestionAbort?.abort();
+    repoSuggestionAbort = null;
+  }
+
+  function resetOwnerSuggestions() {
+    ownerSuggestions = [];
+    ownerSuggestionNote = null;
+    ownerSuggestionIndex = -1;
+  }
+
+  function resetRepoSuggestions() {
+    repoSuggestions = [];
+    repoSuggestionNote = null;
+    repoSuggestionIndex = -1;
+  }
+
+  async function fetchJSON<T>(url: string, signal: AbortSignal): Promise<T> {
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json"
+    };
+    if (import.meta.env.VITE_GITHUB_TOKEN) {
+      headers.Authorization = `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`;
+    }
+
+    const response = await fetch(url, { headers, signal });
+    if (!response.ok) {
+      throw new Error(`GitHub request failed (${response.status})`);
+    }
+    return (await response.json()) as T;
+  }
+
+  function handleOwnerInput(event: Event) {
+    const value = (event.currentTarget as HTMLInputElement).value.trim();
+    owner = value;
+    resetOwnerSuggestions();
+    abortOwnerSuggestions();
+    abortRepoSuggestions();
+    resetRepoSuggestions();
+    repoValidationAbort?.abort();
+    if (repoValidationDebounce) {
+      clearTimeout(repoValidationDebounce);
+      repoValidationDebounce = undefined;
+    }
+    repoValidationState = "idle";
+    repoSuggestionIndex = -1;
+    ownerValidationState = value.length >= 3 ? "pending" : "idle";
+    ownerValidationAbort?.abort();
+    if (ownerSuggestionDebounce) {
+      clearTimeout(ownerSuggestionDebounce);
+    }
+    if (ownerValidationDebounce) {
+      clearTimeout(ownerValidationDebounce);
+    }
+    if (value.length < 3) {
+      ownerValidationState = "idle";
+      return;
+    }
+    ownerSuggestionDebounce = setTimeout(() => {
+      void loadOwnerSuggestions(value);
+    }, 200);
+    ownerValidationDebounce = setTimeout(() => {
+      void validateOwner(value);
+    }, 200);
+  }
+
+  async function loadOwnerSuggestions(query: string) {
+    abortOwnerSuggestions();
+    const controller = new AbortController();
+    ownerSuggestionAbort = controller;
+    try {
+      const data = await fetchJSON<{
+        total_count: number;
+        items: Array<{ login: string }>;
+      }>(
+        `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
+        controller.signal
+      );
+      ownerSuggestions = data.items.map((item) => item.login);
+      ownerSuggestionIndex = -1;
+      ownerSuggestionNote = data.total_count > 20 ? "Type more characters to refine results." : null;
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        ownerSuggestionNote = "Failed to load owner suggestions.";
+      }
+    }
+  }
+
+  function scrollSuggestionIntoView(kind: "owner" | "repo", index: number) {
+    if (index < 0 || typeof document === "undefined") {
+      return;
+    }
+    const id = kind === "owner" ? `owner-suggestion-${index}` : `repo-suggestion-${index}`;
+    document.getElementById(id)?.scrollIntoView({ block: "nearest" });
+  }
+
+  async function handleOwnerKeyDown(event: KeyboardEvent) {
+    if (event.key === "ArrowDown" && ownerSuggestions.length > 0) {
+      event.preventDefault();
+      const next = ownerSuggestionIndex + 1;
+      ownerSuggestionIndex =
+        next >= ownerSuggestions.length ? 0 : next;
+      scrollSuggestionIntoView("owner", ownerSuggestionIndex);
+      return;
+    }
+    if (event.key === "ArrowUp" && ownerSuggestions.length > 0) {
+      event.preventDefault();
+      const next = ownerSuggestionIndex - 1;
+      ownerSuggestionIndex =
+        next < 0 ? ownerSuggestions.length - 1 : next;
+      scrollSuggestionIntoView("owner", ownerSuggestionIndex);
+      return;
+    }
+    if (event.key === "Escape") {
+      if (ownerSuggestions.length > 0 || ownerSuggestionNote) {
+        event.preventDefault();
+        resetOwnerSuggestions();
+      }
+      return;
+    }
+    if (event.key === "Tab" && ownerSuggestions.length > 0) {
+      event.preventDefault();
+      const targetIndex = ownerSuggestionIndex >= 0 ? ownerSuggestionIndex : 0;
+      applyOwnerSuggestion(ownerSuggestions[targetIndex]);
+      repoInputEl?.focus();
+    } else if (event.key === "Enter") {
+      const value = owner.trim();
+      if (ownerSuggestions.length > 0 && ownerSuggestionIndex >= 0) {
+        event.preventDefault();
+        applyOwnerSuggestion(ownerSuggestions[ownerSuggestionIndex]);
+        return;
+      }
+      if (value.length >= 3) {
+        event.preventDefault();
+        if (ownerValidationState !== "valid") {
+          const result = await validateOwner(value);
+          if (!result) {
+            return;
+          }
+        }
+        repo = "";
+        resetRepoSuggestions();
+        repoValidationAbort?.abort();
+        if (repoValidationDebounce) {
+          clearTimeout(repoValidationDebounce);
+          repoValidationDebounce = undefined;
+        }
+        repoValidationState = "idle";
+        progressEntries = [];
+        gitEntryLookup.clear();
+        summaries = [];
+        descriptions = [];
+        selectedIndex = 0;
+        highlightedContributor = null;
+        batchStatus = null;
+        void handleSubmit();
+      }
+    }
+  }
+
+  function applyOwnerSuggestion(login: string) {
+    owner = login;
+    resetOwnerSuggestions();
+    ownerValidationState = "valid";
+    ownerValidationAbort?.abort();
+    if (ownerValidationDebounce) {
+      clearTimeout(ownerValidationDebounce);
+      ownerValidationDebounce = undefined;
+    }
+    repoValidationAbort?.abort();
+    if (repoValidationDebounce) {
+      clearTimeout(repoValidationDebounce);
+      repoValidationDebounce = undefined;
+    }
+    repoValidationState = "idle";
+    repo = "";
+    resetRepoSuggestions();
+    repoInputEl?.focus();
+  }
+
+  function handleRepoInput(event: Event) {
+    if (!ownerIsValid) {
+      return;
+    }
+    const value = (event.currentTarget as HTMLInputElement).value.trim();
+    const ownerLogin = owner.trim();
+    repo = value;
+    resetRepoSuggestions();
+    abortRepoSuggestions();
+    repoSuggestionIndex = -1;
+    repoValidationAbort?.abort();
+    if (repoValidationDebounce) {
+      clearTimeout(repoValidationDebounce);
+      repoValidationDebounce = undefined;
+    }
+    if (repoSuggestionDebounce) {
+      clearTimeout(repoSuggestionDebounce);
+      repoSuggestionDebounce = undefined;
+    }
+    if (!value) {
+      repoValidationState = "idle";
+      return;
+    }
+    repoValidationState = "pending";
+    if (ownerLogin.length === 0) {
+      return;
+    }
+    if (value.length >= 3) {
+      repoSuggestionDebounce = setTimeout(() => {
+        void loadRepoSuggestions(ownerLogin, value);
+      }, 200);
+    }
+    repoValidationDebounce = setTimeout(() => {
+      void validateRepo(ownerLogin, value);
+    }, 250);
+  }
+
+  function handleRepoFocus() {
+    if (!ownerIsValid) {
+      return;
+    }
+    const ownerLogin = owner.trim();
+    const value = repo.trim();
+    if (!ownerLogin) {
+      return;
+    }
+    if (value.length >= 3) {
+      abortRepoSuggestions();
+      void loadRepoSuggestions(ownerLogin, value);
+    }
+    if (value && repoValidationState !== "valid") {
+      repoValidationAbort?.abort();
+      if (repoValidationDebounce) {
+        clearTimeout(repoValidationDebounce);
+        repoValidationDebounce = undefined;
+      }
+      repoValidationState = "pending";
+      void validateRepo(ownerLogin, value);
+    }
+  }
+
+  async function loadRepoSuggestions(ownerLogin: string, prefix: string) {
+    abortRepoSuggestions();
+    const controller = new AbortController();
+    repoSuggestionAbort = controller;
+    try {
+      const data = await fetchJSON<{
+        total_count: number;
+        items: Array<{ name: string; full_name: string }>;
+      }>(
+        `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${ownerLogin} ${prefix} in:name`)}&per_page=20`,
+        controller.signal
+      );
+      repoSuggestions = data.items
+        .filter((item) => item.full_name.startsWith(`${ownerLogin}/`))
+        .map((item) => item.name);
+      repoSuggestionIndex = -1;
+      repoSuggestionNote = data.total_count > 20 ? "Type more characters to refine results." : null;
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        repoSuggestionNote = "Failed to load repository suggestions.";
+      }
+    }
+  }
+
+  function handleRepoKeyDown(event: KeyboardEvent) {
+    if (event.key === "ArrowDown" && repoSuggestions.length > 0) {
+      event.preventDefault();
+      const next = repoSuggestionIndex + 1;
+      repoSuggestionIndex =
+        next >= repoSuggestions.length ? 0 : next;
+      scrollSuggestionIntoView("repo", repoSuggestionIndex);
+      return;
+    }
+    if (event.key === "ArrowUp" && repoSuggestions.length > 0) {
+      event.preventDefault();
+      const next = repoSuggestionIndex - 1;
+      repoSuggestionIndex =
+        next < 0 ? repoSuggestions.length - 1 : next;
+      scrollSuggestionIntoView("repo", repoSuggestionIndex);
+      return;
+    }
+    if (event.key === "Escape") {
+      if (repoSuggestions.length > 0 || repoSuggestionNote) {
+        event.preventDefault();
+        resetRepoSuggestions();
+      }
+      return;
+    }
+    if (event.key === "Tab" && repoSuggestions.length > 0) {
+      event.preventDefault();
+      const targetIndex = repoSuggestionIndex >= 0 ? repoSuggestionIndex : 0;
+      applyRepoSuggestion(repoSuggestions[targetIndex]);
+      return;
+    }
+    if (event.key === "Enter" && repoSuggestions.length > 0 && repoSuggestionIndex >= 0) {
+      event.preventDefault();
+      applyRepoSuggestion(repoSuggestions[repoSuggestionIndex]);
+    }
+  }
+
+  function applyRepoSuggestion(name: string) {
+    repo = name;
+    resetRepoSuggestions();
+    repoValidationAbort?.abort();
+    if (repoValidationDebounce) {
+      clearTimeout(repoValidationDebounce);
+      repoValidationDebounce = undefined;
+    }
+    const ownerLogin = owner.trim();
+    if (ownerLogin) {
+      repoValidationState = "pending";
+      void validateRepo(ownerLogin, name);
+    }
+  }
+
+  async function validateOwner(login: string): Promise<boolean> {
+    if (!login.trim()) {
+      ownerValidationState = "idle";
+      return false;
+    }
+    ownerValidationAbort?.abort();
+    const controller = new AbortController();
+    ownerValidationAbort = controller;
+    ownerValidationState = "pending";
+    try {
+      const response = await fetch(`https://api.github.com/users/${login}`, {
+        signal: controller.signal,
+        headers: import.meta.env.VITE_GITHUB_TOKEN
+          ? {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
+            }
+          : { Accept: "application/vnd.github+json" }
+      });
+      if (!response.ok) {
+        ownerValidationState = "invalid";
+        return false;
+      }
+      ownerValidationState = "valid";
+      return true;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        return false;
+      }
+      ownerValidationState = "invalid";
+      return false;
+    } finally {
+      if (ownerValidationAbort === controller) {
+        ownerValidationAbort = null;
+      }
+    }
+  }
+
+  async function validateRepo(ownerLogin: string, repoName: string): Promise<boolean> {
+    const login = ownerLogin.trim();
+    const repoValue = repoName.trim();
+    if (!login || !repoValue) {
+      repoValidationState = "idle";
+      return false;
+    }
+    repoValidationAbort?.abort();
+    const controller = new AbortController();
+    repoValidationAbort = controller;
+    repoValidationState = "pending";
+    try {
+      const response = await fetch(`https://api.github.com/repos/${login}/${repoValue}`, {
+        signal: controller.signal,
+        headers: import.meta.env.VITE_GITHUB_TOKEN
+          ? {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
+            }
+          : { Accept: "application/vnd.github+json" }
+      });
+      if (!response.ok) {
+        repoValidationState = "invalid";
+        return false;
+      }
+      repoValidationState = "valid";
+      return true;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        return false;
+      }
+      repoValidationState = "invalid";
+      return false;
+    } finally {
+      if (repoValidationAbort === controller) {
+        repoValidationAbort = null;
+      }
+    }
+  }
+
+  onMount(() => {
+    const handleGlobalPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (
+        (ownerSuggestions.length > 0 || ownerSuggestionNote) &&
+        ownerFieldEl &&
+        !ownerFieldEl.contains(target)
+      ) {
+        resetOwnerSuggestions();
+      }
+      if (
+        (repoSuggestions.length > 0 || repoSuggestionNote) &&
+        repoFieldEl &&
+        !repoFieldEl.contains(target)
+      ) {
+        resetRepoSuggestions();
+      }
+    };
+    window.addEventListener("pointerdown", handleGlobalPointerDown);
+    return () => {
+      window.removeEventListener("pointerdown", handleGlobalPointerDown);
+    };
+  });
 </script>
 
 <div class="page">
@@ -538,26 +1069,92 @@
 
   <section class="controls">
     <form onsubmit={handleSubmit}>
-      <div class="field">
+      <div class="field field--with-suggestions" bind:this={ownerFieldEl}>
         <label for="owner">Owner</label>
-        <input
-          id="owner"
-          name="owner"
-          bind:value={owner}
-          required
-          placeholder="torvalds"
-        />
+        <div class="input-wrapper">
+          <input
+            id="owner"
+            name="owner"
+            bind:value={owner}
+            required
+            placeholder="torvalds"
+            bind:this={ownerInputEl}
+            oninput={handleOwnerInput}
+            onkeydown={handleOwnerKeyDown}
+            class:owner-valid={ownerIsValid}
+            aria-invalid={ownerValidationState === "invalid"}
+            aria-expanded={ownerSuggestions.length > 0 || ownerSuggestionNote ? "true" : "false"}
+            aria-controls={ownerSuggestions.length > 0 || ownerSuggestionNote ? "owner-suggestions" : undefined}
+            aria-activedescendant={
+              ownerSuggestionIndex >= 0 ? `owner-suggestion-${ownerSuggestionIndex}` : undefined
+            }
+          />
+          {#if ownerSuggestions.length > 0 || ownerSuggestionNote}
+            <ul class="suggestions" role="listbox" id="owner-suggestions">
+              {#each ownerSuggestions as suggestion, index}
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => applyOwnerSuggestion(suggestion)}
+                    role="option"
+                    aria-selected={index === ownerSuggestionIndex}
+                    class:active={index === ownerSuggestionIndex}
+                    id={`owner-suggestion-${index}`}
+                  >
+                    {suggestion}
+                  </button>
+                </li>
+              {/each}
+              {#if ownerSuggestionNote}
+                <li class="suggestions__note">{ownerSuggestionNote}</li>
+              {/if}
+            </ul>
+          {/if}
+        </div>
       </div>
-      <div class="field">
+      <div class="field field--with-suggestions" bind:this={repoFieldEl}>
         <label for="repo">Repository</label>
-        <input
-          id="repo"
-          name="repo"
-          bind:value={repo}
-          required
-          placeholder="linux"
-          disabled={includeTopStarred}
-        />
+        <div class="input-wrapper">
+          <input
+            id="repo"
+            name="repo"
+            bind:value={repo}
+            placeholder="linux"
+            disabled={!ownerIsValid}
+            bind:this={repoInputEl}
+            oninput={handleRepoInput}
+            onkeydown={handleRepoKeyDown}
+            onfocus={handleRepoFocus}
+            class:repo-valid={repoValidationState === "valid"}
+            aria-invalid={repoValidationState === "invalid"}
+            aria-expanded={repoSuggestions.length > 0 || repoSuggestionNote ? "true" : "false"}
+            aria-controls={repoSuggestions.length > 0 || repoSuggestionNote ? "repo-suggestions" : undefined}
+            aria-activedescendant={
+              repoSuggestionIndex >= 0 ? `repo-suggestion-${repoSuggestionIndex}` : undefined
+            }
+          />
+          {#if repoSuggestions.length > 0 || repoSuggestionNote}
+            <ul class="suggestions" role="listbox" id="repo-suggestions">
+              {#each repoSuggestions as suggestion, index}
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => applyRepoSuggestion(suggestion)}
+                    role="option"
+                    aria-selected={index === repoSuggestionIndex}
+                    class:active={index === repoSuggestionIndex}
+                    id={`repo-suggestion-${index}`}
+                  >
+                    {suggestion}
+                  </button>
+                </li>
+              {/each}
+              {#if repoSuggestionNote}
+                <li class="suggestions__note">{repoSuggestionNote}</li>
+              {/if}
+            </ul>
+          {/if}
+        </div>
       </div>
       <div class="field">
         <label for="limit">Top contributors per year</label>
@@ -571,32 +1168,6 @@
           step="1"
           required
         />
-      </div>
-      <div class="field field--checkbox">
-        <label for="include-top-starred">
-          <input
-            id="include-top-starred"
-            name="include-top-starred"
-            type="checkbox"
-            bind:checked={includeTopStarred}
-            disabled={!owner.trim()}
-            onchange={() => {
-              if (includeTopStarred) {
-                repo = "";
-              }
-              progressEntries = [];
-              gitEntryLookup.clear();
-              summaries = [];
-              selectedIndex = 0;
-              highlightedContributor = null;
-              batchStatus = null;
-              if (includeTopStarred) {
-                void handleSubmit();
-              }
-            }}
-          />
-          <span>{topStarredLabel}</span>
-        </label>
       </div>
       <div class="field field--checkbox">
         <label for="exclude-bots">
@@ -615,20 +1186,6 @@
         Handling <code>{batchStatus.slug}</code> {batchStatus.current}/{batchStatus.total}
       </p>
     {/if}
-    <div class="actions">
-        <button type="submit" disabled={loading}>
-          {#if loading}
-            <span class="spinner" aria-hidden="true"></span>
-            <span>
-              {progressEntries.length
-                ? progressEntries[progressEntries.length - 1].message
-                : "Working..."}
-            </span>
-          {:else}
-            <span>Generate chart</span>
-          {/if}
-        </button>
-      </div>
     </form>
 
     <div class="examples">
@@ -638,7 +1195,7 @@
           <button
             type="button"
             onclick={() => useExample(example)}
-            disabled={loading || includeTopStarred}
+            disabled={loading}
           >
             {example.owner}/{example.repo}
           </button>
@@ -668,9 +1225,9 @@
   <section class="chart">
   {#if filteredSummaries.length === 0}
     <div class="chart-card single">
-      <ContributionChart
-        {loading}
-        series={activeSummary?.series ?? []}
+        <ContributionChart
+          {loading}
+          series={activeSummary?.series ?? []}
           periods={activeSummary?.periods ?? []}
           interval={activeSummary?.interval ?? "year"}
           highlighted={highlightedContributor}
@@ -681,9 +1238,15 @@
     {:else}
       <div
         class="chart-strip"
+        class:dragging={pointerDragging}
         bind:this={chartStrip}
         onscroll={handleChartScroll}
         onwheel={handleChartWheel}
+        onpointerdown={handlePointerDown}
+        onpointermove={handlePointerMove}
+        onpointerup={handlePointerUp}
+        onpointerleave={handlePointerLeave}
+        onpointercancel={handlePointerCancel}
         ontouchstart={handleTouchStart}
         ontouchmove={handleTouchMove}
         ontouchend={handleTouchEnd}
@@ -694,6 +1257,9 @@
             <header class="chart-card__header">
               <span class="chart-card__index">{index + 1}/{filteredSummaries.length}</span>
               <span class="chart-card__slug">{item.slug}</span>
+              {#if descriptions[index]}
+                <span class="chart-card__description">{descriptions[index]}</span>
+              {/if}
             </header>
             <ContributionChart
               loading={false}
@@ -856,6 +1422,10 @@
       box-shadow 0.2s ease;
   }
 
+  input::placeholder {
+    color: rgba(15, 23, 42, 0.45);
+  }
+
   .field--checkbox {
     align-self: center;
   }
@@ -877,49 +1447,6 @@
     outline: none;
     border-color: #2563eb;
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
-  }
-
-  .actions {
-    display: flex;
-    justify-content: flex-start;
-  }
-
-  button[type="submit"] {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.75rem 1.5rem;
-    border-radius: 999px;
-    border: none;
-    background: #1d4ed8;
-    color: #fff;
-    font-size: 1rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-      transform 0.15s ease,
-      box-shadow 0.15s ease;
-  }
-
-  button[type="submit"]:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 12px 24px rgba(29, 78, 216, 0.2);
-  }
-
-  button[type="submit"][disabled] {
-    opacity: 0.6;
-    cursor: pointer;
-    transform: none;
-    box-shadow: none;
-  }
-
-  .spinner {
-    width: 1.1rem;
-    height: 1.1rem;
-    border-radius: 999px;
-    border: 2px solid rgba(255, 255, 255, 0.35);
-    border-left-color: #fff;
-    animation: spin 0.9s linear infinite;
   }
 
   .examples {
@@ -995,6 +1522,67 @@
     opacity: 0.55;
   }
 
+  .field--with-suggestions .input-wrapper {
+    position: relative;
+  }
+
+  .field--with-suggestions .input-wrapper input {
+    width: 100%;
+  }
+
+  .suggestions {
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    left: 0;
+    right: 0;
+    list-style: none;
+    margin: 0;
+    padding: 0.35rem 0;
+    border: 1px solid rgba(15, 23, 42, 0.1);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.98);
+    display: grid;
+    gap: 0.25rem;
+    box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
+    z-index: 10;
+    max-height: 14rem;
+    overflow-y: auto;
+  }
+
+  .suggestions li {
+    margin: 0;
+    padding: 0;
+  }
+
+  .suggestions button {
+    width: 100%;
+    text-align: left;
+    padding: 0.4rem 0.8rem;
+    background: transparent;
+    border: 0;
+    font-size: 0.9rem;
+    color: #1f2937;
+    cursor: pointer;
+  }
+
+  .suggestions button:hover,
+  .suggestions button:focus-visible,
+  .suggestions button.active {
+    background: rgba(37, 99, 235, 0.12);
+    outline: none;
+  }
+
+  .suggestions__note {
+    font-size: 0.8rem;
+    color: #4b5563;
+    padding: 0.3rem 0.8rem;
+  }
+
+  input.owner-valid,
+  input.repo-valid {
+    font-weight: 700;
+  }
+
   .batch-status {
     margin: 0;
     font-size: 0.9rem;
@@ -1015,6 +1603,7 @@
     gap: 1.5rem;
     scroll-snap-type: x mandatory;
     padding-bottom: 0.5rem;
+    cursor: grab;
   }
 
   .chart-strip::-webkit-scrollbar {
@@ -1024,6 +1613,15 @@
   .chart-strip::-webkit-scrollbar-thumb {
     background: rgba(30, 64, 175, 0.4);
     border-radius: 999px;
+  }
+
+  .chart-strip.dragging {
+    cursor: grabbing;
+    user-select: none;
+  }
+
+  .chart-strip.dragging * {
+    user-select: none;
   }
 
   .chart-card {
@@ -1061,6 +1659,16 @@
 
   .chart-card.active .chart-card__slug {
     color: #1d4ed8;
+  }
+
+  .chart-card__description {
+    display: block;
+    font-size: 0.85rem;
+    color: #4b5563;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .chart-hint {
@@ -1153,15 +1761,6 @@
   .muted {
     color: #888;
   }
-
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
-	}
 
 	@media (max-width: 720px) {
 		.chart,
