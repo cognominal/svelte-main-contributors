@@ -1117,6 +1117,30 @@
     return parts.length > 1 ? parts[1] : slug;
   }
 
+  function extractLogin(profileUrl?: string | null): string | null {
+    if (!profileUrl) {
+      return null;
+    }
+    try {
+      const url = new URL(profileUrl);
+      const segments = url.pathname.split("/").filter(Boolean);
+      if (segments.length === 0) {
+        return null;
+      }
+      return segments[segments.length - 1];
+    } catch {
+      return null;
+    }
+  }
+
+  function avatarSource(entry: ContributorSeries): string | null {
+    const login = extractLogin((entry as { profileUrl?: string }).profileUrl);
+    if (!login) {
+      return null;
+    }
+    return `https://avatars.githubusercontent.com/${encodeURIComponent(login)}?s=96&v=4`;
+  }
+
   function resolveBackgroundColor(element: HTMLElement | null): string {
     let current: HTMLElement | null = element;
     while (current) {
@@ -1585,6 +1609,35 @@
         contributors for each
         {intervalLabel(activeSummary.interval)}.
       </p>
+      {#if activeSummary.periods.length > 0 && activeSummary.periods[0].contributors.length > 0}
+        <div class="avatar-grid">
+          {#each (new Map(activeSummary.series.map((entry) => [entry.name.toLowerCase(), entry])).values()) as seriesEntry}
+            <div class="avatar-card">
+              <a
+                href={contributorLink(seriesEntry.name, seriesEntry.profileUrl)}
+                target="_blank"
+                rel="noreferrer noopener"
+                onmouseenter={() => setHighlight(seriesEntry.name)}
+                onmouseleave={() => setHighlight(null)}
+                onfocus={() => setHighlight(seriesEntry.name)}
+                onblur={() => setHighlight(null)}
+              >
+                {#if avatarSource(seriesEntry)}
+                  <img
+                    class="avatar"
+                    src={avatarSource(seriesEntry) ?? ""}
+                    alt={`Avatar of ${seriesEntry.name}`}
+                    referrerpolicy="no-referrer"
+                  />
+                {:else}
+                  <span class="avatar avatar--fallback" aria-hidden="true">{seriesEntry.name.at(0)}</span>
+                {/if}
+                <span class="avatar-name">{seriesEntry.name}</span>
+              </a>
+            </div>
+          {/each}
+        </div>
+      {/if}
       <div class="table-container">
         <table>
           <thead>
@@ -2131,5 +2184,54 @@
 			padding: 1.1rem;
 			border-radius: 12px;
 		}
+  }
+
+  .avatar-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .avatar-card a {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.35rem;
+    text-decoration: none;
+    color: #1f2937;
+    font-size: 0.85rem;
+  }
+
+  .avatar {
+    width: 3rem;
+    height: 3rem;
+    border-radius: 999px;
+    object-fit: cover;
+    border: 2px solid rgba(37, 99, 235, 0.15);
+    background: #e2e8f0;
+  }
+
+  .avatar-name {
+    max-width: 6rem;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .avatar--fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    color: #1e293b;
+  }
+
+  .avatar--fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    color: #1e293b;
   }
 </style>
