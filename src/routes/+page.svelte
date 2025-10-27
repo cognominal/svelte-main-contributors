@@ -39,6 +39,7 @@
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
   let highlightedContributor = $state<string | null>(null);
+  let excludeBots = $state(true);
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -83,6 +84,7 @@
           owner: trimmedOwner,
           repo: trimmedRepo,
           limit: contributorLimit,
+          excludeBots: false
         }),
         signal: controller.signal,
       });
@@ -334,6 +336,27 @@
   function setHighlight(name: string | null) {
     highlightedContributor = name ? name.trim() : null;
   }
+
+  function filterBots(source: SummaryPayload, shouldExclude: boolean): SummaryPayload {
+    if (!shouldExclude) {
+      return source;
+    }
+
+    const isBot = (name: string) => name.toLowerCase().includes("bot");
+
+    const periods = source.periods.map((period) => ({
+      ...period,
+      contributors: period.contributors.filter((contributor) => !isBot(contributor.author))
+    }));
+
+    const series = source.series.filter((item) => !isBot(item.name));
+
+    return { ...source, periods, series };
+  }
+
+  const filteredSummary = $derived(
+    summary ? filterBots(summary, excludeBots) : null
+  );
 </script>
 
 <div class="page">
@@ -379,6 +402,18 @@
           step="1"
           required
         />
+      </div>
+      <div class="field field--checkbox">
+        <label for="exclude-bots">
+          <input
+            id="exclude-bots"
+            name="exclude-bots"
+            type="checkbox"
+            bind:checked={excludeBots}
+            onchange={() => setHighlight(null)}
+          />
+          <span>Hide bot accounts</span>
+        </label>
       </div>
       <div class="actions">
         <button type="submit" disabled={loading}>
@@ -429,43 +464,43 @@
   <section class="chart">
     <ContributionChart
       {loading}
-      series={summary?.series ?? []}
-      periods={summary?.periods ?? []}
-      interval={summary?.interval ?? "year"}
+      series={filteredSummary?.series ?? []}
+      periods={filteredSummary?.periods ?? []}
+      interval={filteredSummary?.interval ?? "year"}
       highlighted={highlightedContributor}
       on:highlight={(event: CustomEvent<string | null>) =>
         setHighlight(event.detail ?? null)}
     />
   </section>
 
-  {#if summary}
+  {#if filteredSummary}
     <section class="summary">
       <h2>
         <a
-          href={`${GITHUB_BASE_URL}/${summary.slug}`}
+          href={`${GITHUB_BASE_URL}/${filteredSummary.slug}`}
           target="_blank"
           rel="noreferrer noopener"
         >
-          {summary.slug}
+          {filteredSummary.slug}
         </a>
       </h2>
       <p>
-        Tracking commits from {formatRange(summary)}, highlighting the top {limit}
+        Tracking commits from {formatRange(filteredSummary)}, highlighting the top {limit}
         contributors for each
-        {intervalLabel(summary.interval)}.
+        {intervalLabel(filteredSummary.interval)}.
       </p>
       <div class="table-container">
         <table>
           <thead>
             <tr>
-              <th>{summary.interval === "month" ? "Month" : "Year"}</th>
+              <th>{filteredSummary.interval === "month" ? "Month" : "Year"}</th>
               <th>Top contributors</th>
             </tr>
           </thead>
           <tbody>
-            {#each summary.periods as period}
+            {#each filteredSummary.periods as period}
               <tr>
-                <td>{formatPeriodLabel(period, summary.interval)}</td>
+                <td>{formatPeriodLabel(period, filteredSummary.interval)}</td>
                 <td>
                   {#if period.contributors.length === 0}
                     <span class="muted">No commits</span>
@@ -575,6 +610,23 @@
       box-shadow 0.2s ease;
   }
 
+  .field--checkbox {
+    align-self: center;
+  }
+
+  .field--checkbox label {
+    font-weight: 600;
+    font-size: 0.9rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .field--checkbox input[type="checkbox"] {
+    width: 1.1rem;
+    height: 1.1rem;
+  }
+
   input:focus {
     outline: none;
     border-color: #2563eb;
@@ -610,7 +662,7 @@
 
   button[type="submit"][disabled] {
     opacity: 0.6;
-    cursor: progress;
+    cursor: pointer;
     transform: none;
     box-shadow: none;
   }

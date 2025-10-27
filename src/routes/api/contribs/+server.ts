@@ -7,6 +7,7 @@ interface RequestPayload {
 	owner?: string;
 	repo?: string;
 	limit?: number;
+	excludeBots?: boolean;
 }
 
 function serializeSummary(summary: RepoContributionSummary) {
@@ -14,11 +15,29 @@ function serializeSummary(summary: RepoContributionSummary) {
 	return { slug, interval, startDate, endDate, periods, series };
 }
 
+function filterBotContributors(summary: RepoContributionSummary): RepoContributionSummary {
+	const isBot = (name: string) => name.toLowerCase().includes('bot');
+
+	const periods = summary.periods.map((period) => ({
+		...period,
+		contributors: period.contributors.filter((contributor) => !isBot(contributor.author))
+	}));
+
+	const series = summary.series.filter((item) => !isBot(item.name));
+
+	return {
+		...summary,
+		periods,
+		series
+	};
+}
+
 export const POST: RequestHandler = async ({ request }) => {
 	const body = (await request.json()) as RequestPayload;
 	const owner = body.owner?.trim();
 	const repo = body.repo?.trim();
 	const limit = Number(body.limit ?? 5);
+	const excludeBots = body.excludeBots !== false;
 
 	if (!owner || !repo) {
 		return json({ error: 'Both owner and repository are required.' }, { status: 400 });
@@ -90,7 +109,8 @@ export const POST: RequestHandler = async ({ request }) => {
 							onProgress: handleProgress,
 							signal
 						});
-						send({ type: 'result', summary: serializeSummary(summary) });
+						const finalSummary = excludeBots ? filterBotContributors(summary) : summary;
+						send({ type: 'result', summary: serializeSummary(finalSummary) });
 					} catch (error) {
 						if (!signal.aborted) {
 							send({ type: 'error', message: (error as Error).message ?? 'Unknown error' });
