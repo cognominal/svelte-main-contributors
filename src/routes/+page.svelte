@@ -1,6 +1,7 @@
 <script lang="ts">
   import ContributionChart from "$lib/components/ContributionChart.svelte";
   import { fade } from "svelte/transition";
+  import { tick } from "svelte";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
 
   interface SummaryPayload {
@@ -26,7 +27,8 @@
   let limit = $state(5);
   let loading = $state(false);
   let errorMessage = $state("");
-  let summary = $state<SummaryPayload | null>(null);
+  let summaries = $state<SummaryPayload[]>([]);
+  let selectedIndex = $state(0);
   interface ProgressEntry {
     id: string;
     message: string;
@@ -39,7 +41,16 @@
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
   let highlightedContributor = $state<string | null>(null);
+  let includeTopStarred = $state(false);
   let excludeBots = $state(true);
+  let chartStrip = $state<HTMLDivElement | null>(null);
+  let batchStatus = $state<{ slug: string; current: number; total: number } | null>(null);
+  let descriptions = $state<Array<string | undefined>>([]);
+  const topStarredLabel = $derived(
+    owner.trim().length
+      ? `Use ${owner.trim()}'s top starred repos`
+      : "Use owner's top starred repos"
+  );
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -56,8 +67,8 @@
     const contributorLimit = Number(limit);
 
     if (
-      !trimmedOwner ||
-      !trimmedRepo ||
+      (includeTopStarred && !trimmedOwner) ||
+      (!includeTopStarred && (!trimmedOwner || !trimmedRepo)) ||
       !Number.isFinite(contributorLimit) ||
       contributorLimit <= 0
     ) {
@@ -75,6 +86,11 @@
     progressEntries = [];
     gitEntryLookup.clear();
     highlightedContributor = null;
+    summaries = [];
+    selectedIndex = 0;
+    batchStatus = null;
+    await tick();
+    chartStrip?.scrollTo({ left: 0, behavior: "auto" });
 
     try {
       const response = await fetch("/api/contribs", {
@@ -84,7 +100,8 @@
           owner: trimmedOwner,
           repo: trimmedRepo,
           limit: contributorLimit,
-          excludeBots: false
+          excludeBots: false,
+          topStarred: includeTopStarred
         }),
         signal: controller.signal,
       });
@@ -107,7 +124,7 @@
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let receivedResult = false;
+      let receivedComplete = false;
       let receivedError = false;
 
       const MAX_ENTRIES = 20;
@@ -197,24 +214,71 @@
         const trimmed = line.trim();
         if (!trimmed) return;
         try {
-          const event = JSON.parse(trimmed) as
-            | { type: "status"; message: string }
-            | { type: "git"; command: string; stream: "stdout" | "stderr"; text: string }
-            | { type: "result"; summary: SummaryPayload }
-            | { type: "error"; message?: string };
+      const event = JSON.parse(trimmed) as
+        | { type: "status"; message: string }
+        | { type: "git"; command: string; stream: "stdout" | "stderr"; text: string }
+        | {
+            type: "partial";
+            summary: SummaryPayload;
+            index?: number;
+            total?: number;
+            description?: string | null;
+          }
+        | {
+            type: "complete";
+            summaries?: Array<SummaryPayload & { description?: string | null }>;
+          }
+        | { type: "result"; summary: SummaryPayload & { description?: string | null } }
+        | { type: "error"; message?: string };
 
           if (event.type === "status") {
             appendStatus(event.message);
           } else if (event.type === "git") {
             upsertGitEntry(event.command, event.text);
+          } else if (event.type === "partial") {
+            const incoming = event.summary;
+            if (incoming) {
+              const targetIndex = event.index ?? summaries.length;
+              const nextSummaries = [...summaries];
+              const nextDescriptions = [...descriptions];
+              nextSummaries[targetIndex] = incoming;
+              if (event.description !== undefined) {
+                nextDescriptions[targetIndex] = event.description ?? undefined;
+              }
+              const total = event.total ?? nextSummaries.length;
+              batchStatus = {
+                slug: incoming.slug,
+                current: targetIndex + 1,
+                total
+              };
+              summaries = nextSummaries;
+              descriptions = nextDescriptions;
+              selectedIndex = targetIndex;
+              scrollToCard(targetIndex, "auto").catch(() => {});
+            }
+          } else if (event.type === "complete") {
+            summaries = event.summaries ?? [];
+            descriptions = (event.summaries ?? []).map((entry) => entry.description ?? undefined);
+            receivedComplete = true;
+            batchStatus = null;
+            if (summaries.length > 0 && selectedIndex >= summaries.length) {
+              selectedIndex = summaries.length - 1;
+            }
+            scrollToCard(selectedIndex).catch(() => {});
           } else if (event.type === "result") {
-            summary = event.summary;
-            receivedResult = true;
+            summaries = [event.summary];
+            descriptions = [event.summary.description ?? undefined];
+            selectedIndex = 0;
+            receivedComplete = true;
+            batchStatus = null;
+            scrollToCard(0).catch(() => {});
           } else if (event.type === "error") {
             const message =
               event.message ?? "Unable to gather statistics. Please retry later.";
             errorMessage = message;
-            summary = null;
+            summaries = [];
+            descriptions = [];
+            batchStatus = null;
             receivedError = true;
           }
         } catch (parseError) {
@@ -250,7 +314,7 @@
         buffer = "";
       }
 
-      if (!receivedResult && !receivedError) {
+      if (!receivedComplete && summaries.length === 0 && !receivedError) {
         throw new Error("The server did not return any results.");
       }
     } catch (error) {
@@ -258,7 +322,8 @@
         return;
       }
       errorMessage = (error as Error).message;
-      summary = null;
+      summaries = [];
+      descriptions = [];
     } finally {
       if (activeController === controller) {
         activeController = null;
@@ -268,8 +333,13 @@
   }
 
   function useExample(repoExample: { owner: string; repo: string }) {
+    includeTopStarred = false;
     owner = repoExample.owner;
     repo = repoExample.repo;
+    batchStatus = null;
+    progressEntries = [];
+    gitEntryLookup.clear();
+    descriptions = [];
     void handleSubmit();
   }
 
@@ -354,9 +424,107 @@
     return { ...source, periods, series };
   }
 
-  const filteredSummary = $derived(
-    summary ? filterBots(summary, excludeBots) : null
+  const filteredSummaries = $derived(
+    summaries.map((entry) => filterBots(entry, excludeBots))
   );
+
+  const activeSummary = $derived(
+    filteredSummaries[selectedIndex] ?? null
+  );
+
+  const activeDescription = $derived(descriptions[selectedIndex]);
+
+  $effect(() => {
+    if (filteredSummaries.length === 0) {
+      selectedIndex = 0;
+      return;
+    }
+
+    if (selectedIndex > filteredSummaries.length - 1) {
+      selectedIndex = filteredSummaries.length - 1;
+    }
+  });
+
+  async function scrollToCard(index: number, behavior: ScrollBehavior = "smooth") {
+    if (!chartStrip) {
+      return;
+    }
+
+    await tick();
+    const width = chartStrip.clientWidth;
+    if (width === 0) {
+      return;
+    }
+
+    chartStrip.scrollTo({ left: width * index, behavior });
+  }
+
+  $effect(() => {
+    selectedIndex;
+    highlightedContributor = null;
+    scrollToCard(selectedIndex).catch(() => {});
+  });
+
+  function handleChartScroll() {
+    if (!chartStrip) {
+      return;
+    }
+
+    const width = chartStrip.clientWidth;
+    if (width === 0) {
+      return;
+    }
+
+    const nextIndex = Math.round(chartStrip.scrollLeft / width);
+    if (Number.isFinite(nextIndex) && nextIndex !== selectedIndex) {
+      const clamped = Math.min(Math.max(nextIndex, 0), filteredSummaries.length - 1);
+      if (clamped !== selectedIndex) {
+        selectedIndex = clamped;
+      }
+    }
+  }
+
+  function handleChartWheel(event: WheelEvent) {
+    if (!chartStrip) {
+      return;
+    }
+
+    if (Math.abs(event.deltaX) >= Math.abs(event.deltaY)) {
+      event.preventDefault();
+      chartStrip.scrollLeft += event.deltaX;
+    } else if (event.deltaY !== 0) {
+      event.preventDefault();
+      chartStrip.scrollLeft += event.deltaY;
+    }
+  }
+
+  function handleTouchStart(event: TouchEvent) {
+    if (!chartStrip || event.touches.length !== 1) {
+      return;
+    }
+    chartStrip.dataset.prevTouchX = String(event.touches[0].clientX);
+  }
+
+  function handleTouchMove(event: TouchEvent) {
+    if (!chartStrip) {
+      return;
+    }
+    if (event.touches.length !== 1) {
+      return;
+    }
+    event.preventDefault();
+    const touch = event.touches[0];
+    const prev = chartStrip.dataset.prevTouchX ? Number(chartStrip.dataset.prevTouchX) : touch.clientX;
+    const delta = prev - touch.clientX;
+    chartStrip.dataset.prevTouchX = String(touch.clientX);
+    chartStrip.scrollLeft += delta;
+  }
+
+  function handleTouchEnd() {
+    if (chartStrip) {
+      delete chartStrip.dataset.prevTouchX;
+    }
+  }
 </script>
 
 <div class="page">
@@ -388,6 +556,7 @@
           bind:value={repo}
           required
           placeholder="linux"
+          disabled={includeTopStarred}
         />
       </div>
       <div class="field">
@@ -404,6 +573,32 @@
         />
       </div>
       <div class="field field--checkbox">
+        <label for="include-top-starred">
+          <input
+            id="include-top-starred"
+            name="include-top-starred"
+            type="checkbox"
+            bind:checked={includeTopStarred}
+            disabled={!owner.trim()}
+            onchange={() => {
+              if (includeTopStarred) {
+                repo = "";
+              }
+              progressEntries = [];
+              gitEntryLookup.clear();
+              summaries = [];
+              selectedIndex = 0;
+              highlightedContributor = null;
+              batchStatus = null;
+              if (includeTopStarred) {
+                void handleSubmit();
+              }
+            }}
+          />
+          <span>{topStarredLabel}</span>
+        </label>
+      </div>
+      <div class="field field--checkbox">
         <label for="exclude-bots">
           <input
             id="exclude-bots"
@@ -413,9 +608,14 @@
             onchange={() => setHighlight(null)}
           />
           <span>Hide bot accounts</span>
-        </label>
-      </div>
-      <div class="actions">
+      </label>
+    </div>
+    {#if batchStatus}
+      <p class="batch-status" aria-live="polite">
+        Handling <code>{batchStatus.slug}</code> {batchStatus.current}/{batchStatus.total}
+      </p>
+    {/if}
+    <div class="actions">
         <button type="submit" disabled={loading}>
           {#if loading}
             <span class="spinner" aria-hidden="true"></span>
@@ -435,14 +635,18 @@
       <p>Try one of these featured repositories:</p>
       <div class="example-buttons">
         {#each examples as example}
-          <button type="button" onclick={() => useExample(example)} disabled={loading}>
+          <button
+            type="button"
+            onclick={() => useExample(example)}
+            disabled={loading || includeTopStarred}
+          >
             {example.owner}/{example.repo}
           </button>
         {/each}
       </div>
     </div>
 
-    {#if progressEntries.length > 0 && !summary}
+    {#if progressEntries.length > 0 && loading}
       <div class="progress" in:fade={{ duration: 200 }} out:fade={{ duration: 200 }}>
         <p>Progress updates</p>
         <ul>
@@ -462,45 +666,87 @@
   {/if}
 
   <section class="chart">
-    <ContributionChart
-      {loading}
-      series={filteredSummary?.series ?? []}
-      periods={filteredSummary?.periods ?? []}
-      interval={filteredSummary?.interval ?? "year"}
-      highlighted={highlightedContributor}
-      on:highlight={(event: CustomEvent<string | null>) =>
-        setHighlight(event.detail ?? null)}
-    />
+  {#if filteredSummaries.length === 0}
+    <div class="chart-card single">
+      <ContributionChart
+        {loading}
+        series={activeSummary?.series ?? []}
+          periods={activeSummary?.periods ?? []}
+          interval={activeSummary?.interval ?? "year"}
+          highlighted={highlightedContributor}
+          on:highlight={(event: CustomEvent<string | null>) =>
+            setHighlight(event.detail ?? null)}
+        />
+      </div>
+    {:else}
+      <div
+        class="chart-strip"
+        bind:this={chartStrip}
+        onscroll={handleChartScroll}
+        onwheel={handleChartWheel}
+        ontouchstart={handleTouchStart}
+        ontouchmove={handleTouchMove}
+        ontouchend={handleTouchEnd}
+        ontouchcancel={handleTouchEnd}
+      >
+        {#each filteredSummaries as item, index}
+          <article class="chart-card" class:active={index === selectedIndex}>
+            <header class="chart-card__header">
+              <span class="chart-card__index">{index + 1}/{filteredSummaries.length}</span>
+              <span class="chart-card__slug">{item.slug}</span>
+            </header>
+            <ContributionChart
+              loading={false}
+              series={item.series}
+              periods={item.periods}
+              interval={item.interval}
+              highlighted={index === selectedIndex ? highlightedContributor : null}
+              on:highlight={(event: CustomEvent<string | null>) => {
+                if (index === selectedIndex) {
+                  setHighlight(event.detail ?? null);
+                }
+              }}
+            />
+          </article>
+        {/each}
+      </div>
+    {/if}
   </section>
+  {#if filteredSummaries.length > 1}
+    <p class="chart-hint">Swipe horizontally or use trackpad scroll to pan between charts.</p>
+  {/if}
 
-  {#if filteredSummary}
+  {#if activeSummary}
     <section class="summary">
       <h2>
         <a
-          href={`${GITHUB_BASE_URL}/${filteredSummary.slug}`}
+          href={`${GITHUB_BASE_URL}/${activeSummary.slug}`}
           target="_blank"
           rel="noreferrer noopener"
         >
-          {filteredSummary.slug}
+          {activeSummary.slug}
         </a>
       </h2>
+      {#if activeDescription}
+        <p class="summary-tagline">{activeDescription}</p>
+      {/if}
       <p>
-        Tracking commits from {formatRange(filteredSummary)}, highlighting the top {limit}
+        Tracking commits from {formatRange(activeSummary)}, highlighting the top {limit}
         contributors for each
-        {intervalLabel(filteredSummary.interval)}.
+        {intervalLabel(activeSummary.interval)}.
       </p>
       <div class="table-container">
         <table>
           <thead>
             <tr>
-              <th>{filteredSummary.interval === "month" ? "Month" : "Year"}</th>
+              <th>{activeSummary.interval === "month" ? "Month" : "Year"}</th>
               <th>Top contributors</th>
             </tr>
           </thead>
           <tbody>
-            {#each filteredSummary.periods as period}
+            {#each activeSummary.periods as period}
               <tr>
-                <td>{formatPeriodLabel(period, filteredSummary.interval)}</td>
+                <td>{formatPeriodLabel(period, activeSummary.interval)}</td>
                 <td>
                   {#if period.contributors.length === 0}
                     <span class="muted">No commits</span>
@@ -744,11 +990,84 @@
     background: rgba(37, 99, 235, 0.18);
   }
 
+  .examples button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .batch-status {
+    margin: 0;
+    font-size: 0.9rem;
+    color: #1f2937;
+  }
+
   .chart {
     background: #fff;
     padding: 1.5rem;
     border-radius: 16px;
     box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
+    overflow: hidden;
+  }
+
+  .chart-strip {
+    display: flex;
+    overflow-x: auto;
+    gap: 1.5rem;
+    scroll-snap-type: x mandatory;
+    padding-bottom: 0.5rem;
+  }
+
+  .chart-strip::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .chart-strip::-webkit-scrollbar-thumb {
+    background: rgba(30, 64, 175, 0.4);
+    border-radius: 999px;
+  }
+
+  .chart-card {
+    flex: 0 0 100%;
+    scroll-snap-align: start;
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .chart-card.single {
+    flex: 1;
+  }
+
+  .chart-card__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.75rem;
+  }
+
+  .chart-card__index {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #1d4ed8;
+  }
+
+  .chart-card__slug {
+    font-weight: 600;
+    font-size: 1rem;
+    color: #111827;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chart-card.active .chart-card__slug {
+    color: #1d4ed8;
+  }
+
+  .chart-hint {
+    margin: 0.35rem 0 0;
+    font-size: 0.85rem;
+    color: #4b5563;
+    text-align: right;
   }
 
   .error {
@@ -771,6 +1090,12 @@
   .summary h2 {
     margin: 0;
     font-size: 1.5rem;
+  }
+
+  .summary-tagline {
+    margin: 0;
+    color: #374151;
+    font-size: 0.95rem;
   }
 
   .summary p {
