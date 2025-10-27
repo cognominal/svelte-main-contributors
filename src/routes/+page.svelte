@@ -78,6 +78,7 @@
   let snapEnabled = $state(true);
   let snapRestoreId: ReturnType<typeof setTimeout> | null = null;
   let scrollAnimationFrame: number | null = null;
+  let suppressScrollSync = false;
 
   const examples = [
     { owner: "torvalds", repo: "linux" },
@@ -86,10 +87,7 @@
     { owner: "deepseek-ai", repo: "DeepSeek-R1" },
   ];
   onDestroy(() => {
-    if (snapRestoreId) {
-      clearTimeout(snapRestoreId);
-      snapRestoreId = null;
-    }
+    cancelSnapRestore();
     if (scrollAnimationFrame) {
       cancelAnimationFrame(scrollAnimationFrame);
       scrollAnimationFrame = null;
@@ -627,23 +625,38 @@
     scrollAnimationFrame = requestAnimationFrame(step);
   }
 
+  function cancelSnapRestore() {
+    if (snapRestoreId) {
+      clearTimeout(snapRestoreId);
+      snapRestoreId = null;
+    }
+  }
+
   async function scrollToCard(index: number, behavior: ScrollBehavior = "smooth") {
     if (!chartStrip) {
       return;
     }
 
     await tick();
+    cancelSnapRestore();
     const width = chartStrip.clientWidth;
     if (width === 0) {
       return;
     }
 
     const targetLeft = width * index;
+    snapEnabled = false;
+    suppressScrollSync = true;
     if (behavior === "smooth") {
-      animateScrollTo(targetLeft);
+      animateScrollTo(targetLeft, 380, () => {
+        snapEnabled = true;
+        suppressScrollSync = false;
+      });
     } else {
       stopScrollAnimation();
       chartStrip.scrollLeft = targetLeft;
+      snapEnabled = true;
+      suppressScrollSync = false;
     }
   }
 
@@ -654,6 +667,9 @@
   });
 
   function handleChartScroll() {
+    if (suppressScrollSync) {
+      return;
+    }
     if (!chartStrip) {
       return;
     }
@@ -675,11 +691,10 @@
   function scheduleSnapRestore() {
     if (filteredSummaries.length <= 1) {
       snapEnabled = true;
+      suppressScrollSync = false;
       return;
     }
-    if (snapRestoreId) {
-      clearTimeout(snapRestoreId);
-    }
+    cancelSnapRestore();
     if (snapEnabled) {
       snapEnabled = false;
     }
@@ -687,9 +702,11 @@
       snapRestoreId = null;
       if (!chartStrip || filteredSummaries.length === 0) {
         snapEnabled = true;
+        suppressScrollSync = false;
         return;
       }
       const { width, max } = getScrollMetrics();
+      suppressScrollSync = true;
       if (width > 0) {
         const rawIndex = chartStrip.scrollLeft / width;
         const targetIndex = Math.min(
@@ -702,9 +719,11 @@
         const targetLeft = Math.min(Math.max(width * targetIndex, 0), max);
         animateScrollTo(targetLeft, 420, () => {
           snapEnabled = true;
+          suppressScrollSync = false;
         });
       } else {
         snapEnabled = true;
+        suppressScrollSync = false;
       }
     }, 180);
   }
@@ -1724,6 +1743,9 @@
           class="thumbnail"
           class:active={index === selectedIndex}
           onclick={() => {
+            cancelSnapRestore();
+            stopScrollAnimation();
+            snapEnabled = false;
             selectedIndex = index;
             requestAnimationFrame(() => {
               scrollToCard(index).catch(() => {});
