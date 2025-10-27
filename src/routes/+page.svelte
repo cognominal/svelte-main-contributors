@@ -18,6 +18,7 @@
         author: string;
         commits: number;
         profileUrl?: string;
+        email?: string;
       }>;
     }>;
   }
@@ -62,7 +63,7 @@
   let chartCardElements = $state<Array<HTMLElement | null>>([]);
   let thumbnailUrls = $state<Array<string | null>>([]);
   let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>([]);
-  let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number } | null>(null);
+  let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number; availableBytes: number } | null>(null);
   let storageStatus = $state<"idle" | "loading" | "error" | "ready">("idle");
   let storageError = $state<string | null>(null);
   const GITHUB_BASE_URL = "https://github.com";
@@ -1133,8 +1134,28 @@
     }
   }
 
-  function avatarSource(entry: ContributorSeries): string | null {
-    const login = extractLogin((entry as { profileUrl?: string }).profileUrl);
+  function resolvedProfileUrl(name: string, fallback?: string | null): string | undefined {
+    if (fallback) {
+      return fallback;
+    }
+    const summary = activeSummary;
+    if (!summary) {
+      return undefined;
+    }
+    const lower = name.toLowerCase();
+    for (const period of summary.periods) {
+      for (const contributor of period.contributors) {
+        if (contributor.profileUrl && contributor.author.toLowerCase() === lower) {
+          return contributor.profileUrl;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function avatarSource(name: string, fallback?: string | null): string | null {
+    const profileUrl = resolvedProfileUrl(name, fallback) ?? null;
+    const login = extractLogin(profileUrl);
     if (!login) {
       return null;
     }
@@ -1179,6 +1200,7 @@
         gitBytes: number;
         usedBytes: number;
         totalBytes: number;
+        availableBytes: number;
       };
       storageInfo = data;
       storageStatus = "ready";
@@ -1446,7 +1468,10 @@
     </div>
     <p class="storage-info">
       {#if storageStatus === "ready" && storageInfo}
-        <span>{formatBytes(storageInfo.gitBytes)} / {formatBytes(storageInfo.totalBytes)}</span>
+        <span class="storage-info__line">
+          {formatBytes(storageInfo.gitBytes)} of {formatBytes(storageInfo.totalBytes)} used
+          <span class="storage-info__available">(available {formatBytes(storageInfo.availableBytes ?? Math.max(storageInfo.totalBytes - storageInfo.usedBytes, 0))})</span>
+        </span>
       {:else if storageStatus === "loading"}
         <span>Checking storage…</span>
       {:else if storageStatus === "error" && storageError}
@@ -1614,7 +1639,7 @@
           {#each (new Map(activeSummary.series.map((entry) => [entry.name.toLowerCase(), entry])).values()) as seriesEntry}
             <div class="avatar-card">
               <a
-                href={contributorLink(seriesEntry.name, seriesEntry.profileUrl)}
+                href={contributorLink(seriesEntry.name, resolvedProfileUrl(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl) ?? undefined)}
                 target="_blank"
                 rel="noreferrer noopener"
                 onmouseenter={() => setHighlight(seriesEntry.name)}
@@ -1622,10 +1647,10 @@
                 onfocus={() => setHighlight(seriesEntry.name)}
                 onblur={() => setHighlight(null)}
               >
-                {#if avatarSource(seriesEntry)}
+                {#if avatarSource(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl)}
                   <img
                     class="avatar"
-                    src={avatarSource(seriesEntry) ?? ""}
+                    src={avatarSource(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl) ?? ""}
                     alt={`Avatar of ${seriesEntry.name}`}
                     referrerpolicy="no-referrer"
                   />
@@ -1788,6 +1813,17 @@
 
   .storage-info__error {
     color: #b91c1c;
+  }
+
+  .storage-info__line {
+    display: inline-flex;
+    gap: 0.35rem;
+    align-items: baseline;
+  }
+
+  .storage-info__available {
+    color: #2563eb;
+    font-weight: 600;
   }
 
   input:focus {

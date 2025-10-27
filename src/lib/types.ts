@@ -4,6 +4,7 @@ export interface PeriodContributor {
 	author: string;
 	commits: number;
 	profileUrl?: string;
+	email?: string;
 }
 
 export interface ContributorSeries {

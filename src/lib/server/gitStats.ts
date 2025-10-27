@@ -44,6 +44,29 @@ export interface ContributionSummaryOptions {
 const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
 
 const GITHUB_BASE_URL = 'https://github.com';
+const GITHUB_API_VERSION = '2022-11-28';
+
+const githubProfileCache = new Map<string, string | null>();
+
+function normalizeEmail(email?: string | null): string | null {
+	if (!email) {
+		return null;
+	}
+	return email.trim().toLowerCase() || null;
+}
+
+function githubRequestHeaders(): Record<string, string> {
+	const headers: Record<string, string> = {
+		Accept: 'application/vnd.github+json',
+		'X-GitHub-Api-Version': GITHUB_API_VERSION
+	};
+
+	if (process.env.GITHUB_TOKEN) {
+		headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+	}
+
+	return headers;
+}
 
 function throwIfAborted(signal?: AbortSignal): void {
 	if (!signal?.aborted) {
@@ -281,9 +304,90 @@ function parseShortlog(output: string, limit: number): PeriodContributor[] {
 			return {
 				author: identity.name,
 				commits: Number.isNaN(commits) ? 0 : commits,
-				profileUrl: identity.profileUrl
+				profileUrl: identity.profileUrl,
+				email: identity.email
 			};
 		});
+}
+
+async function lookupProfileUrlFromGitHub(
+	slug: string,
+	repoPath: string,
+	email: string,
+	signal?: AbortSignal
+): Promise<string | undefined> {
+	const normalized = normalizeEmail(email);
+	if (!normalized) {
+		return undefined;
+	}
+
+	const cached = githubProfileCache.get(normalized);
+	if (cached !== undefined) {
+		return cached ?? undefined;
+	}
+
+	try {
+		const commitOutput = await runCommand(
+			'git',
+			['log', '--format=%H', '--max-count=1', `--author=${email}`],
+			{ cwd: repoPath, signal, allowFailure: true }
+		);
+		const commitSha = commitOutput
+			.split('\n')
+			.map((line) => line.trim())
+			.find(Boolean);
+		if (!commitSha) {
+			githubProfileCache.set(normalized, null);
+			return undefined;
+		}
+
+		const response = await fetch(`https://api.github.com/repos/${slug}/commits/${commitSha}`, {
+			headers: githubRequestHeaders(),
+			signal
+		});
+
+		if (!response.ok) {
+			githubProfileCache.set(normalized, null);
+			return undefined;
+		}
+
+		const payload = (await response.json()) as {
+			author?: { login?: string | null; html_url?: string | null };
+		};
+		const login = payload.author?.login ?? undefined;
+		const htmlUrl = payload.author?.html_url ?? undefined;
+		const profileUrl = htmlUrl ?? (login ? `${GITHUB_BASE_URL}/${login}` : undefined);
+		if (!profileUrl) {
+			githubProfileCache.set(normalized, null);
+			return undefined;
+		}
+
+		githubProfileCache.set(normalized, profileUrl);
+		return profileUrl;
+	} catch (error) {
+		if ((error as Error)?.name === 'AbortError') {
+			throw error;
+		}
+		githubProfileCache.set(normalized, null);
+		return undefined;
+	}
+}
+
+async function fetchProfilesForEmails(
+	slug: string,
+	repoPath: string,
+	lookups: Iterable<[string, { email: string }]>,
+	signal?: AbortSignal
+): Promise<Map<string, string>> {
+	const resolved = new Map<string, string>();
+	for (const [normalizedEmail, { email }] of lookups) {
+		throwIfAborted(signal);
+		const profileUrl = await lookupProfileUrlFromGitHub(slug, repoPath, email, signal).catch(() => undefined);
+		if (profileUrl) {
+			resolved.set(normalizedEmail, profileUrl);
+		}
+	}
+	return resolved;
 }
 
 function formatDateUTC(date: Date): string {
@@ -366,7 +470,11 @@ export async function collectContributionSummary(
 	const periods: RepoContributionSummary['periods'] = [];
 	const contributorMap = new Map<
 		string,
-		{ commits: Map<string, number>; name: string; profileUrl?: string }
+		{ commits: Map<string, number>; name: string; profileUrl?: string; emails: Set<string> }
+	>();
+	const pendingProfileLookups = new Map<
+		string,
+		{ email: string; references: Array<{ periodIndex: number; contributorIndex: number }> }
 	>();
 
 	const progressStride = Math.max(1, Math.ceil(periodDefinitions.length / 10));
@@ -389,7 +497,9 @@ export async function collectContributionSummary(
 		);
 
 		const contributors = parseShortlog(output, limit);
-		periods.push({ ...period, contributors });
+		const periodRecord = { ...period, contributors };
+		periods.push(periodRecord);
+		const periodIndex = periods.length - 1;
 		if ((index + 1) % progressStride === 0 || index === periodDefinitions.length - 1) {
 			options?.onProgress?.({
 				type: 'status',
@@ -397,20 +507,68 @@ export async function collectContributionSummary(
 			});
 		}
 
-		for (const { author, commits, profileUrl } of contributors) {
-			const contributorKey = profileUrl ?? author;
+		for (const [contributorIndex, contributor] of contributors.entries()) {
+			const { author, commits, profileUrl, email } = contributor;
+			const normalizedEmail = normalizeEmail(email);
+			if (!profileUrl && normalizedEmail) {
+				const existingLookup = pendingProfileLookups.get(normalizedEmail);
+				if (existingLookup) {
+					existingLookup.references.push({ periodIndex, contributorIndex });
+				} else {
+					pendingProfileLookups.set(normalizedEmail, {
+						email: email!,
+						references: [{ periodIndex, contributorIndex }]
+					});
+				}
+			}
+
+			const contributorKey = profileUrl ?? author.toLowerCase();
 			const existing = contributorMap.get(contributorKey);
 			if (existing) {
 				existing.commits.set(period.label, commits);
 				if (!existing.profileUrl && profileUrl) {
 					existing.profileUrl = profileUrl;
 				}
+				if (normalizedEmail) {
+					existing.emails.add(normalizedEmail);
+				}
 				continue;
 			}
 
 			const perPeriod = new Map<string, number>();
 			perPeriod.set(period.label, commits);
-			contributorMap.set(contributorKey, { commits: perPeriod, name: author, profileUrl });
+			const emails = normalizedEmail ? new Set<string>([normalizedEmail]) : new Set<string>();
+			contributorMap.set(contributorKey, { commits: perPeriod, name: author, profileUrl, emails });
+		}
+	}
+
+	if (pendingProfileLookups.size > 0) {
+		const resolvedProfiles = await fetchProfilesForEmails(
+			slug,
+			repoPath,
+			pendingProfileLookups,
+			options?.signal
+		);
+
+		for (const [normalizedEmail, profileUrl] of resolvedProfiles) {
+			const lookup = pendingProfileLookups.get(normalizedEmail);
+			if (!lookup) {
+				continue;
+			}
+
+			for (const { periodIndex, contributorIndex } of lookup.references) {
+				const periodEntry = periods[periodIndex];
+				const contributor = periodEntry?.contributors?.[contributorIndex];
+				if (contributor && !contributor.profileUrl) {
+					contributor.profileUrl = profileUrl;
+				}
+			}
+
+			for (const entry of contributorMap.values()) {
+				if (!entry.profileUrl && entry.emails.has(normalizedEmail)) {
+					entry.profileUrl = profileUrl;
+				}
+			}
 		}
 	}
 

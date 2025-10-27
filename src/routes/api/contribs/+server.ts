@@ -13,7 +13,11 @@ interface RequestPayload {
 
 function serializeSummary(summary: RepoContributionSummary) {
 	const { slug, interval, startDate, endDate, periods, series } = summary;
-	return { slug, interval, startDate, endDate, periods, series };
+	const sanitizedPeriods = periods.map((period) => ({
+		...period,
+		contributors: period.contributors.map(({ email: _email, ...rest }) => rest)
+	}));
+	return { slug, interval, startDate, endDate, periods: sanitizedPeriods, series };
 }
 
 function filterBotContributors(summary: RepoContributionSummary): RepoContributionSummary {
