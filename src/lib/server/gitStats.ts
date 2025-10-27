@@ -47,12 +47,26 @@ const GITHUB_BASE_URL = 'https://github.com';
 const GITHUB_API_VERSION = '2022-11-28';
 
 const githubProfileCache = new Map<string, string | null>();
+const githubNameCache = new Map<string, string | null>();
 
 function normalizeEmail(email?: string | null): string | null {
 	if (!email) {
 		return null;
 	}
 	return email.trim().toLowerCase() || null;
+}
+
+function normalizeName(name?: string | null): string | null {
+	if (!name) {
+		return null;
+	}
+	const stripped = name
+		.normalize('NFKD')
+		.replace(/[\u0300-\u036f]/g, '')
+		.replace(/[^a-zA-Z0-9]/g, '')
+		.toLowerCase()
+		.trim();
+	return stripped || null;
 }
 
 function githubRequestHeaders(): Record<string, string> {
@@ -314,17 +328,42 @@ async function lookupProfileUrlFromGitHub(
 	slug: string,
 	repoPath: string,
 	email: string,
+	name: string | undefined,
 	signal?: AbortSignal
 ): Promise<string | undefined> {
-	const normalized = normalizeEmail(email);
-	if (!normalized) {
+	const normalizedEmail = normalizeEmail(email);
+	const normalizedName = normalizeName(name);
+
+	if (!normalizedEmail) {
+		if (normalizedName) {
+			return await lookupProfileUrlByName(name!, signal);
+		}
 		return undefined;
 	}
 
-	const cached = githubProfileCache.get(normalized);
+	const cached = githubProfileCache.get(normalizedEmail);
 	if (cached !== undefined) {
 		return cached ?? undefined;
 	}
+
+	const applyNameCache = (profileUrl: string | undefined) => {
+		if (profileUrl && normalizedName) {
+			githubNameCache.set(normalizedName, profileUrl);
+		}
+	};
+
+	const attemptNameFallback = async () => {
+		if (name) {
+			const viaName = await lookupProfileUrlByName(name, signal);
+			if (viaName) {
+				githubProfileCache.set(normalizedEmail, viaName);
+				applyNameCache(viaName);
+				return viaName;
+			}
+		}
+		githubProfileCache.set(normalizedEmail, null);
+		return undefined;
+	};
 
 	try {
 		const commitOutput = await runCommand(
@@ -337,8 +376,7 @@ async function lookupProfileUrlFromGitHub(
 			.map((line) => line.trim())
 			.find(Boolean);
 		if (!commitSha) {
-			githubProfileCache.set(normalized, null);
-			return undefined;
+			return await attemptNameFallback();
 		}
 
 		const response = await fetch(`https://api.github.com/repos/${slug}/commits/${commitSha}`, {
@@ -347,47 +385,142 @@ async function lookupProfileUrlFromGitHub(
 		});
 
 		if (!response.ok) {
-			githubProfileCache.set(normalized, null);
-			return undefined;
+			return await attemptNameFallback();
 		}
 
 		const payload = (await response.json()) as {
 			author?: { login?: string | null; html_url?: string | null };
+			commit?: { author?: { name?: string | null }; committer?: { name?: string | null } };
 		};
 		const login = payload.author?.login ?? undefined;
 		const htmlUrl = payload.author?.html_url ?? undefined;
-		const profileUrl = htmlUrl ?? (login ? `${GITHUB_BASE_URL}/${login}` : undefined);
+		let profileUrl = htmlUrl ?? (login ? `${GITHUB_BASE_URL}/${login}` : undefined);
+
 		if (!profileUrl) {
-			githubProfileCache.set(normalized, null);
-			return undefined;
+			const fallbackName =
+				payload.commit?.author?.name ??
+				payload.commit?.committer?.name ??
+				name;
+			if (fallbackName) {
+				profileUrl = await lookupProfileUrlByName(fallbackName, signal);
+			}
 		}
 
-		githubProfileCache.set(normalized, profileUrl);
+		if (!profileUrl) {
+			return await attemptNameFallback();
+		}
+
+		githubProfileCache.set(normalizedEmail, profileUrl);
+		applyNameCache(profileUrl);
 		return profileUrl;
 	} catch (error) {
 		if ((error as Error)?.name === 'AbortError') {
 			throw error;
 		}
-		githubProfileCache.set(normalized, null);
-		return undefined;
+		return await attemptNameFallback();
 	}
 }
 
 async function fetchProfilesForEmails(
 	slug: string,
 	repoPath: string,
-	lookups: Iterable<[string, { email: string }]>,
+	lookups: Iterable<[string, { email: string; name: string }]>,
 	signal?: AbortSignal
 ): Promise<Map<string, string>> {
 	const resolved = new Map<string, string>();
-	for (const [normalizedEmail, { email }] of lookups) {
+	for (const [normalizedEmail, { email, name }] of lookups) {
 		throwIfAborted(signal);
-		const profileUrl = await lookupProfileUrlFromGitHub(slug, repoPath, email, signal).catch(() => undefined);
+		const profileUrl = await lookupProfileUrlFromGitHub(slug, repoPath, email, name, signal).catch(() => undefined);
 		if (profileUrl) {
 			resolved.set(normalizedEmail, profileUrl);
 		}
 	}
 	return resolved;
+}
+
+async function lookupProfileUrlByName(name: string, signal?: AbortSignal): Promise<string | undefined> {
+	const normalized = normalizeName(name);
+	if (!normalized) {
+		return undefined;
+	}
+
+	const cached = githubNameCache.get(normalized);
+	if (cached !== undefined) {
+		return cached ?? undefined;
+	}
+
+	try {
+		const query = `${name} in:fullname`;
+		const response = await fetch(
+			`https://api.github.com/search/users?q=${encodeURIComponent(query)}&per_page=5`,
+			{
+				headers: githubRequestHeaders(),
+				signal
+			}
+		);
+
+		if (!response.ok) {
+			githubNameCache.set(normalized, null);
+			return undefined;
+		}
+
+		const payload = (await response.json()) as { items?: Array<{ login?: string | null; html_url?: string | null }> };
+		const items = payload.items ?? [];
+
+		const evaluateCandidate = async (login: string, htmlUrl?: string | null): Promise<string | undefined> => {
+			const loginNormalized = normalizeName(login);
+			if (loginNormalized && (loginNormalized === normalized || normalized.includes(loginNormalized))) {
+				return htmlUrl ?? `${GITHUB_BASE_URL}/${login}`;
+			}
+
+			try {
+				const detailResponse = await fetch(`https://api.github.com/users/${login}`, {
+					headers: githubRequestHeaders(),
+					signal
+				});
+				if (!detailResponse.ok) {
+					return undefined;
+				}
+				const user = (await detailResponse.json()) as { name?: string | null; html_url?: string | null };
+				const candidateName = normalizeName(user.name ?? login);
+				if (candidateName && (candidateName === normalized || normalized.includes(candidateName))) {
+					return user.html_url ?? `${GITHUB_BASE_URL}/${login}`;
+				}
+				return undefined;
+			} catch (error) {
+				if ((error as Error)?.name === 'AbortError') {
+					throw error;
+				}
+				return undefined;
+			}
+		};
+
+		for (const item of items) {
+			if (!item?.login) {
+				continue;
+			}
+			const match = await evaluateCandidate(item.login, item.html_url);
+			if (match) {
+				githubNameCache.set(normalized, match);
+				return match;
+			}
+		}
+
+		if (items.length > 0 && items[0]?.login) {
+			const fallback = items[0].html_url ?? `${GITHUB_BASE_URL}/${items[0].login}`;
+			githubNameCache.set(normalized, fallback);
+			return fallback;
+		}
+
+		githubNameCache.set(normalized, null);
+		return undefined;
+	} catch (error) {
+		if ((error as Error)?.name === 'AbortError') {
+			throw error;
+		}
+		githubNameCache.set(normalized, null);
+		return undefined;
+	}
 }
 
 function formatDateUTC(date: Date): string {
@@ -474,7 +607,7 @@ export async function collectContributionSummary(
 	>();
 	const pendingProfileLookups = new Map<
 		string,
-		{ email: string; references: Array<{ periodIndex: number; contributorIndex: number }> }
+		{ email: string; name: string; references: Array<{ periodIndex: number; contributorIndex: number }> }
 	>();
 
 	const progressStride = Math.max(1, Math.ceil(periodDefinitions.length / 10));
@@ -517,6 +650,7 @@ export async function collectContributionSummary(
 				} else {
 					pendingProfileLookups.set(normalizedEmail, {
 						email: email!,
+						name: author,
 						references: [{ periodIndex, contributorIndex }]
 					});
 				}
