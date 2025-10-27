@@ -1,7 +1,7 @@
 <script lang="ts">
   import ContributionChart from "$lib/components/ContributionChart.svelte";
   import { fade } from "svelte/transition";
-  import { tick, onMount } from "svelte";
+  import { tick, onMount, onDestroy } from "svelte";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
 
   interface SummaryPayload {
@@ -75,6 +75,9 @@
   let ownerValidationDebounce: ReturnType<typeof setTimeout> | undefined;
   let repoSuggestionDebounce: ReturnType<typeof setTimeout> | undefined;
   let repoValidationDebounce: ReturnType<typeof setTimeout> | undefined;
+  let snapEnabled = $state(true);
+  let snapRestoreId: ReturnType<typeof setTimeout> | null = null;
+  let scrollAnimationFrame: number | null = null;
 
   const examples = [
     { owner: "torvalds", repo: "linux" },
@@ -82,6 +85,16 @@
     { owner: "sveltejs", repo: "kit" },
     { owner: "deepseek-ai", repo: "DeepSeek-R1" },
   ];
+  onDestroy(() => {
+    if (snapRestoreId) {
+      clearTimeout(snapRestoreId);
+      snapRestoreId = null;
+    }
+    if (scrollAnimationFrame) {
+      cancelAnimationFrame(scrollAnimationFrame);
+      scrollAnimationFrame = null;
+    }
+  });
 
   async function handleSubmit(event?: SubmitEvent) {
     event?.preventDefault();
@@ -561,6 +574,59 @@
     }
   });
 
+  function stopScrollAnimation() {
+    if (scrollAnimationFrame) {
+      cancelAnimationFrame(scrollAnimationFrame);
+      scrollAnimationFrame = null;
+    }
+  }
+
+  function getScrollMetrics() {
+    if (!chartStrip) {
+      return { width: 0, max: 0, bounce: 0 };
+    }
+    const width = chartStrip.clientWidth;
+    const maxIndex = Math.max(filteredSummaries.length - 1, 0);
+    const max = width * maxIndex;
+    const bounce = width * 0.25;
+    return { width, max, bounce };
+  }
+
+  function animateScrollTo(targetLeft: number, duration = 380, onComplete?: () => void) {
+    if (!chartStrip) {
+      return;
+    }
+    stopScrollAnimation();
+    const start = chartStrip.scrollLeft;
+    const distance = targetLeft - start;
+    if (Math.abs(distance) < 0.5) {
+      chartStrip.scrollLeft = targetLeft;
+      onComplete?.();
+      return;
+    }
+    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      if (!chartStrip) {
+        scrollAnimationFrame = null;
+        return;
+      }
+      const elapsed = now - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = easeOutCubic(progress);
+      chartStrip.scrollLeft = start + distance * eased;
+      if (progress < 1) {
+        scrollAnimationFrame = requestAnimationFrame(step);
+      } else {
+        scrollAnimationFrame = null;
+        onComplete?.();
+      }
+    };
+
+    scrollAnimationFrame = requestAnimationFrame(step);
+  }
+
   async function scrollToCard(index: number, behavior: ScrollBehavior = "smooth") {
     if (!chartStrip) {
       return;
@@ -572,7 +638,13 @@
       return;
     }
 
-    chartStrip.scrollTo({ left: width * index, behavior });
+    const targetLeft = width * index;
+    if (behavior === "smooth") {
+      animateScrollTo(targetLeft);
+    } else {
+      stopScrollAnimation();
+      chartStrip.scrollLeft = targetLeft;
+    }
   }
 
   $effect(() => {
@@ -600,18 +672,61 @@
     }
   }
 
+  function scheduleSnapRestore() {
+    if (filteredSummaries.length <= 1) {
+      snapEnabled = true;
+      return;
+    }
+    if (snapRestoreId) {
+      clearTimeout(snapRestoreId);
+    }
+    if (snapEnabled) {
+      snapEnabled = false;
+    }
+    snapRestoreId = setTimeout(() => {
+      snapRestoreId = null;
+      if (!chartStrip || filteredSummaries.length === 0) {
+        snapEnabled = true;
+        return;
+      }
+      const { width, max } = getScrollMetrics();
+      if (width > 0) {
+        const rawIndex = chartStrip.scrollLeft / width;
+        const targetIndex = Math.min(
+          Math.max(Math.round(rawIndex), 0),
+          filteredSummaries.length - 1
+        );
+        if (targetIndex !== selectedIndex) {
+          selectedIndex = targetIndex;
+        }
+        const targetLeft = Math.min(Math.max(width * targetIndex, 0), max);
+        animateScrollTo(targetLeft, 420, () => {
+          snapEnabled = true;
+        });
+      } else {
+        snapEnabled = true;
+      }
+    }, 180);
+  }
+
   function handleChartWheel(event: WheelEvent) {
     if (!chartStrip) {
       return;
     }
 
+    const { max, bounce } = getScrollMetrics();
+    stopScrollAnimation();
+
     if (Math.abs(event.deltaX) >= Math.abs(event.deltaY)) {
       event.preventDefault();
-      chartStrip.scrollLeft += event.deltaX;
+      const next = chartStrip.scrollLeft + event.deltaX;
+      chartStrip.scrollLeft = Math.max(-bounce, Math.min(next, max + bounce));
     } else if (event.deltaY !== 0) {
       event.preventDefault();
-      chartStrip.scrollLeft += event.deltaY;
+      const next = chartStrip.scrollLeft + event.deltaY;
+      chartStrip.scrollLeft = Math.max(-bounce, Math.min(next, max + bounce));
     }
+    scheduleSnapRestore();
   }
 
   function handleTouchStart(event: TouchEvent) {
@@ -619,6 +734,8 @@
       return;
     }
     chartStrip.dataset.prevTouchX = String(event.touches[0].clientX);
+    stopScrollAnimation();
+    scheduleSnapRestore();
   }
 
   function handleTouchMove(event: TouchEvent) {
@@ -629,17 +746,22 @@
       return;
     }
     event.preventDefault();
+    stopScrollAnimation();
     const touch = event.touches[0];
     const prev = chartStrip.dataset.prevTouchX ? Number(chartStrip.dataset.prevTouchX) : touch.clientX;
     const delta = prev - touch.clientX;
     chartStrip.dataset.prevTouchX = String(touch.clientX);
-    chartStrip.scrollLeft += delta;
+    const { max, bounce } = getScrollMetrics();
+    const next = chartStrip.scrollLeft + delta;
+    chartStrip.scrollLeft = Math.max(-bounce, Math.min(next, max + bounce));
+    scheduleSnapRestore();
   }
 
   function handleTouchEnd() {
     if (chartStrip) {
       delete chartStrip.dataset.prevTouchX;
     }
+    scheduleSnapRestore();
   }
 
   function handlePointerDown(event: PointerEvent) {
@@ -654,6 +776,8 @@
     chartStrip.setPointerCapture?.(event.pointerId);
     pointerDragging = true;
     event.preventDefault();
+    stopScrollAnimation();
+    scheduleSnapRestore();
   }
 
   function handlePointerMove(event: PointerEvent) {
@@ -661,8 +785,11 @@
       return;
     }
     event.preventDefault();
+    const { max, bounce } = getScrollMetrics();
     const delta = event.clientX - pointerDrag.startX;
-    chartStrip.scrollLeft = pointerDrag.scrollLeft - delta;
+    const next = pointerDrag.scrollLeft - delta;
+    chartStrip.scrollLeft = Math.max(-bounce, Math.min(next, max + bounce));
+    scheduleSnapRestore();
   }
 
   function endPointerDrag(event: PointerEvent) {
@@ -672,6 +799,7 @@
     chartStrip.releasePointerCapture?.(event.pointerId);
     pointerDrag = null;
     pointerDragging = false;
+    scheduleSnapRestore();
   }
 
   async function captureThumbnail(index: number) {
@@ -1538,6 +1666,7 @@
       <div
         class="chart-strip"
         class:dragging={pointerDragging}
+        class:free-scroll={!snapEnabled}
         bind:this={chartStrip}
         onscroll={handleChartScroll}
         onwheel={handleChartWheel}
@@ -1987,6 +2116,10 @@
     scroll-snap-type: x mandatory;
     padding-bottom: 0.5rem;
     cursor: grab;
+  }
+
+  .chart-strip.free-scroll {
+    scroll-snap-type: none;
   }
 
   .chart-strip::-webkit-scrollbar {
