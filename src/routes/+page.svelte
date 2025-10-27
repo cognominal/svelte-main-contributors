@@ -1,5 +1,6 @@
 <script lang="ts">
   import ContributionChart from "$lib/components/ContributionChart.svelte";
+  import { fade } from "svelte/transition";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
 
   interface SummaryPayload {
@@ -37,6 +38,7 @@
   let progressEntries = $state<ProgressEntry[]>([]);
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
+  let highlightedContributor = $state<string | null>(null);
   const GITHUB_BASE_URL = "https://github.com";
 
   const examples = [
@@ -71,6 +73,7 @@
     errorMessage = "";
     progressEntries = [];
     gitEntryLookup.clear();
+    highlightedContributor = null;
 
     try {
       const response = await fetch("/api/contribs", {
@@ -135,27 +138,32 @@
         });
       };
 
-      const upsertGitEntry = (command: string, text: string) => {
+      const upsertGitEntry = (command: string, text: string | undefined) => {
+        if (!text) {
+          return;
+        }
+
         const trimmed = text.trim();
         if (!trimmed) {
           return;
         }
 
         const timestamp = Date.now();
-        const label = `[${command}] ${trimmed}`;
-        const existingId = gitEntryLookup.get(command);
+        const safeCommand = command || "git";
+        const label = `[${safeCommand}] ${trimmed}`;
+        const existingId = gitEntryLookup.get(safeCommand);
         if (existingId) {
           const existingEntry = progressEntries.find((entry) => entry.id === existingId);
           if (!existingEntry) {
-            gitEntryLookup.delete(command);
+            gitEntryLookup.delete(safeCommand);
             const id = `${timestamp}-${Math.random()}`;
-            gitEntryLookup.set(command, id);
+            gitEntryLookup.set(safeCommand, id);
             appendEntry({
               id,
               message: label,
               timestamp,
               kind: "git",
-              command
+              command: safeCommand
             });
             return;
           }
@@ -173,13 +181,13 @@
         }
 
         const id = `${timestamp}-${Math.random()}`;
-        gitEntryLookup.set(command, id);
+        gitEntryLookup.set(safeCommand, id);
         appendEntry({
           id,
           message: label,
           timestamp,
           kind: "git",
-          command
+          command: safeCommand
         });
       };
 
@@ -322,6 +330,10 @@
       second: "2-digit"
     }).format(date);
   }
+
+  function setHighlight(name: string | null) {
+    highlightedContributor = name ? name.trim() : null;
+  }
 </script>
 
 <div class="page">
@@ -396,7 +408,7 @@
     </div>
 
     {#if progressEntries.length > 0 && !summary}
-      <div class="progress">
+      <div class="progress" in:fade={{ duration: 200 }} out:fade={{ duration: 200 }}>
         <p>Progress updates</p>
         <ul>
           {#each progressEntries as entry, index}
@@ -420,6 +432,9 @@
       series={summary?.series ?? []}
       periods={summary?.periods ?? []}
       interval={summary?.interval ?? "year"}
+      highlighted={highlightedContributor}
+      on:highlight={(event: CustomEvent<string | null>) =>
+        setHighlight(event.detail ?? null)}
     />
   </section>
 
@@ -457,7 +472,14 @@
                   {:else}
                     <ul>
                       {#each period.contributors as contributor}
-                        <li>
+                        <li
+                          class:active={
+                            highlightedContributor &&
+                            highlightedContributor.toLowerCase() === contributor.author.toLowerCase()
+                          }
+                          onmouseenter={() => setHighlight(contributor.author)}
+                          onmouseleave={() => setHighlight(null)}
+                        >
                           <a
                             href={contributorLink(
                               contributor.author,
@@ -465,6 +487,8 @@
                             )}
                             target="_blank"
                             rel="noreferrer noopener"
+                            onfocus={() => setHighlight(contributor.author)}
+                            onblur={() => setHighlight(null)}
                           >
                             {contributor.author} ({contributor.commits})
                           </a>
@@ -733,6 +757,20 @@
     padding: 0;
     display: grid;
     gap: 0.25rem;
+  }
+
+  td li {
+    border-radius: 6px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  td li.active {
+    background: rgba(37, 99, 235, 0.12);
+  }
+
+  td li.active a {
+    color: #1d4ed8;
+    font-weight: 600;
   }
 
   .muted {

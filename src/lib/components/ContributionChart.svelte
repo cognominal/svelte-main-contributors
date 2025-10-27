@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { line, curveMonotoneX } from 'd3-shape';
+	import { createEventDispatcher } from 'svelte';
 	import { scaleLinear, scalePoint } from 'd3-scale';
 	import type { ContributorSeries } from '$lib/types';
 
@@ -18,13 +19,20 @@
 
 	type Period = { label: string; start: string; end: string };
 
+	interface $$Events {
+		highlight: CustomEvent<string | null>;
+	}
+
+	const dispatch = createEventDispatcher<{ highlight: string | null }>();
+
 	const {
 		series = [],
 		periods = [],
 		interval = 'year',
 		width = 960,
 		height = 540,
-		loading = false
+		loading = false,
+		highlighted = null
 	} = $props<{
 		series?: ContributorSeries[];
 		periods?: Period[];
@@ -32,6 +40,7 @@
 		width?: number;
 		height?: number;
 		loading?: boolean;
+		highlighted?: string | null;
 	}>();
 
 	const margin = { top: 56, right: 240, bottom: 56, left: 80 };
@@ -148,6 +157,25 @@
 	});
 
 	const yTicks = $derived(yScale.ticks(6));
+
+	const normalisedHighlight = $derived(
+		highlighted ? highlighted.trim().toLowerCase() : null
+	);
+
+	function isEmphasised(name: string): boolean {
+		if (!normalisedHighlight) {
+			return false;
+		}
+		return name.trim().toLowerCase() === normalisedHighlight;
+	}
+
+	function handleLegendEnter(name: string): void {
+		dispatch('highlight', name);
+	}
+
+	function handleLegendLeave(): void {
+		dispatch('highlight', null);
+	}
 </script>
 
 {#if loading}
@@ -191,7 +219,9 @@
 		</g>
 
 		{#each chartSeries as item}
-			<g class="series">
+			{@const emphasised = isEmphasised(item.name)}
+			{@const dimmed = normalisedHighlight && !emphasised}
+			<g class="series" class:emphasised class:dimmed>
 				<path d={item.path} style={`stroke: ${item.color}`} />
 				{#each item.points as point}
 					{#if point.commits > 0}
@@ -219,7 +249,21 @@
 
 		<g class="legend">
 			{#each chartSeries as item, index}
-				<g transform={`translate(${margin.left + chartWidth + 24} ${margin.top + index * 26})`}>
+				{@const emphasised = isEmphasised(item.name)}
+				{@const dimmed = normalisedHighlight && !emphasised}
+				<g
+					class="legend-item"
+					class:emphasised
+					class:dimmed
+					transform={`translate(${margin.left + chartWidth + 24} ${margin.top + index * 26})`}
+					tabindex="0"
+					role="button"
+					aria-pressed={emphasised}
+					onmouseenter={() => handleLegendEnter(item.name)}
+					onfocus={() => handleLegendEnter(item.name)}
+					onmouseleave={handleLegendLeave}
+					onblur={handleLegendLeave}
+				>
 					<rect width="16" height="16" style={`fill: ${item.color}`} />
 					<text x="22" y="12">{item.name} ({item.total})</text>
 				</g>
@@ -254,15 +298,26 @@
 		stroke: rgba(0, 0, 0, 0.06);
 	}
 
-	.series path {
-		fill: none;
-		stroke-width: 2;
-	}
+.series path {
+	fill: none;
+	stroke-width: 2;
+	transition: stroke-width 0.2s ease, opacity 0.2s ease;
+}
 
-	.series circle {
-		stroke: #fff;
-		stroke-width: 1;
-	}
+.series circle {
+	stroke: #fff;
+	stroke-width: 1;
+	transition: opacity 0.2s ease;
+}
+
+.series.emphasised path {
+	stroke-width: 3;
+}
+
+.series.dimmed path,
+.series.dimmed circle {
+	opacity: 0.25;
+}
 
 	.axis-label {
 		fill: #444;
@@ -273,11 +328,32 @@
 		text-transform: uppercase;
 	}
 
-	.legend text {
-		fill: #333;
-		font-family: var(--font-body, system-ui, sans-serif);
-		font-size: 13px;
-	}
+.legend text {
+	fill: #333;
+	font-family: var(--font-body, system-ui, sans-serif);
+	font-size: 13px;
+}
+
+.legend-item {
+	cursor: pointer;
+	outline: none;
+	transition: opacity 0.2s ease;
+}
+
+.legend-item.dimmed {
+	opacity: 0.45;
+}
+
+.legend-item.emphasised text {
+	font-weight: 600;
+}
+
+.legend-item:focus-visible {
+	outline: 2px solid var(--legend-focus, #2563eb);
+	outline-offset: 3px;
+	border-radius: 6px;
+	padding: 2px;
+}
 
 	.placeholder {
 		display: grid;
