@@ -33,6 +33,12 @@ The CLI syncs the repository, aggregates commits, and saves an SVG named like `o
 ## Checks
 - `bun run check` &mdash; run SvelteKit's type and accessibility checks
 
+## UI Components
+- Tailwind CSS v4 is configured in `tailwind.config.ts` and `postcss.config.cjs`. Global tokens live in `src/app.postcss`.
+- Use `npx shadcn-svelte@latest add <component>` to pull new primitives into `$lib/components/ui`; the CLI reads defaults from `components.json`.
+- Reuse the `cn` helper in `src/lib/utils.ts` when composing utility classes, and keep shared helpers under `$lib/utils`.
+- Import `../app.postcss` inside any new layout roots so Tailwind layers stay active.
+
 ## Environment
 - Set `VITE_GITHUB_TOKEN` (optional) to raise API rate limits for owner/repository auto-complete and top-starred batch syncing.
 - UI code uses modern Svelte event attributes (`onclick`, `onmouseenter`, ...). Avoid the deprecated `on:` syntax when adding handlers.
