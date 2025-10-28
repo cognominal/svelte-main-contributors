@@ -18,3 +18,4 @@ This repository was modified with the support of an automated assistant operatin
 - Event handling uses the modern attribute syntax (`onclick`, `onmouseenter`, etc.) for compatibility with Svelte 5 semantics.
 - New UI work must use shadcn-svelte components (via `npx shadcn-svelte@latest add <component>`) and live under `$lib/components/ui`.
 - Type safety is enforced via `bun --bunx svelte-check --tsconfig ./tsconfig.json`; changes must pass before landing.
+- All generated .md files, including this one, must have line less then 80 chars.

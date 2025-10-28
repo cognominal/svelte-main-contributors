@@ -1,0 +1,56 @@
+#!/bin/bash
+
+# Script: gc1
+# Description: Clones a GitHub repository with depth 1 into ~/git/user----repo
+# Usage: gc1 <GitHub_URL|user/repo>
+# Examples:
+#   gc1 https://github.com/torvalds/linux
+#   gc1 torvalds/linux
+
+# Check if git is installed
+if ! command -v git &>/dev/null; then
+  echo "Error: git is not installed. Please install git and try again."
+  exit 1
+fi
+
+# Check if a URL or shorthand is provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 <GitHub_URL|user/repo>"
+  echo "Examples:"
+  echo "  $0 https://github.com/torvalds/linux"
+  echo "  $0 torvalds/linux"
+  exit 1
+fi
+
+github_url="$1"
+
+# Extract user and repo from the URL
+if [[ "$github_url" =~ ^https://github.com/([^/]+)/([^/]+)(\.git)?/?$ ]]; then
+  user="${BASH_REMATCH[1]}"
+  repo_name="${BASH_REMATCH[2]}"
+elif [[ "$github_url" =~ ^([^/]+)/([^/]+)(\.git)?$ ]]; then
+  user="${BASH_REMATCH[1]}"
+  repo_name="${BASH_REMATCH[2]}"
+  github_url="https://github.com/$user/$repo_name"
+else
+  echo "Error: Invalid repository format. Use https://github.com/user/repo or user/repo"
+  exit 1
+fi
+
+# Create the target directory name
+target_dir_name="$user---$repo_name"
+target_path="$HOME/git/$target_dir_name"
+
+# Create ~/git if it doesn't exist
+mkdir -p "$HOME/git"
+
+# Perform the git clone operation
+echo "Cloning $github_url with depth 1 into $target_path..."
+git clone --depth=1 "$github_url" "$target_path"
+
+if [ $? -eq 0 ]; then
+  echo "Repository cloned successfully!"
+else
+  echo "Error: Failed to clone the repository."
+  exit 1
+fi
