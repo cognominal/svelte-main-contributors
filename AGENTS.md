@@ -16,4 +16,5 @@ This repository was modified with the support of an automated assistant operatin
 - The UI can request and render up to five of the currently selected owner's most-starred repositories; the API validates the owner, fetches their repositories via GitHub's REST search, and clones each sequentially while streaming per-repo progress.
 - Horizontal chart scrolling captures wheel and touch gestures to prevent MacOS swipe navigation while panning between SVG panes.
 - Event handling uses the modern attribute syntax (`onclick`, `onmouseenter`, etc.) for compatibility with Svelte 5 semantics.
+- New UI work must use shadcn-svelte components (via `npx shadcn-svelte@latest add <component>`) and live under `$lib/components/ui`.
 - Type safety is enforced via `bun --bunx svelte-check --tsconfig ./tsconfig.json`; changes must pass before landing.
