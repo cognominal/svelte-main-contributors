@@ -16,6 +16,11 @@ The cloned repos are under `~/git/userName---repoName`. If repo have `---` in th
 
 It ships with a web UI for browsing contribution to chart the top contributors per interval as an SVG.
 
+## Documentation
+
+- [CACHING.md](CACHING.md) &mdash; caching mechanism and performance
+- [GITHUB.md](GITHUB.md) &mdash; GitHub API usage and endpoints
+
 ## Prerequisites
 
 ## Install
