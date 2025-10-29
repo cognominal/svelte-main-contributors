@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createPersistentCache } from '$lib/server/cache';
 import type {
@@ -51,6 +51,11 @@ const githubProfileCache = new Map<string, string | null>();
 const githubNameCache = new Map<string, string | null>();
 const githubProfileStore = createPersistentCache<string | null>('github-profiles-by-email.json');
 const githubNameStore = createPersistentCache<string | null>('github-profiles-by-name.json');
+const summaryStore = createPersistentCache<{
+	slug: string;
+	limit: number;
+	summary: Omit<RepoContributionSummary, 'repoPath'>;
+}>('contribution-summaries.json', { maxEntries: 50, maxAgeMs: 1000 * 60 * 60 * 24 });
 
 async function hydrateEmailProfileCache(normalizedEmail: string | null): Promise<void> {
 	if (!normalizedEmail || githubProfileCache.has(normalizedEmail)) {
@@ -139,6 +144,62 @@ function repoDirectoryForSlug(slug: string): string {
 	return join(homedir(), 'git', safeName);
 }
 
+function summaryCacheKey(slug: string, limit: number): string {
+	return `${slug.toLowerCase()}::${limit}`;
+}
+
+function sanitizeSummary(summary: RepoContributionSummary): Omit<RepoContributionSummary, 'repoPath'> {
+	const { repoPath: _repoPath, periods, series, ...rest } = summary;
+	return {
+		...rest,
+		periods: periods.map((period) => ({
+			label: period.label,
+			start: period.start,
+			end: period.end,
+			contributors: period.contributors.map((contributor) => ({ ...contributor }))
+		})),
+		series: series.map((item) => ({
+			name: item.name,
+			total: item.total,
+			profileUrl: item.profileUrl,
+			values: item.values.map((value) => ({ ...value }))
+		}))
+	};
+}
+
+export async function getCachedContributionSummary(
+	slug: string,
+	limit: number
+): Promise<RepoContributionSummary | null> {
+	const cacheKey = summaryCacheKey(slug, limit);
+	const cachedSummaryEntry = await summaryStore.get(cacheKey).catch(() => undefined);
+	const cachedValue = cachedSummaryEntry?.value;
+	if (!cachedValue || cachedValue.slug !== slug || cachedValue.limit !== limit) {
+		return null;
+	}
+
+	const cachedSummary = cachedValue.summary;
+	const clonedPeriods = cachedSummary.periods.map((period) => ({
+		label: period.label,
+		start: period.start,
+		end: period.end,
+		contributors: period.contributors.map((contributor) => ({ ...contributor }))
+	}));
+	const clonedSeries = cachedSummary.series.map((series) => ({
+		name: series.name,
+		total: series.total,
+		profileUrl: series.profileUrl,
+		values: series.values.map((value) => ({ ...value }))
+	}));
+
+	return {
+		...cachedSummary,
+		repoPath: repoDirectoryForSlug(slug),
+		periods: clonedPeriods,
+		series: clonedSeries
+	};
+}
+
 async function runCommand(command: string, args: string[], options: RunOptions): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
@@ -146,12 +207,54 @@ async function runCommand(command: string, args: string[], options: RunOptions):
 			env: {
 				...process.env,
 				GIT_TERMINAL_PROMPT: '0'
-			},
-			signal: options.signal
+			}
 		});
 
 		let stdout = '';
 		let stderr = '';
+		let settled = false;
+
+		const cleanup = () => {
+			if (!settled) {
+				settled = true;
+				try {
+					// Try graceful termination first
+					child.kill('SIGTERM');
+					// Immediately follow up with SIGKILL for git processes that ignore SIGTERM
+					setTimeout(() => {
+						try {
+							child.kill('SIGKILL');
+						} catch (e) {
+							// Process already dead, ignore
+						}
+					}, 100); // Reduced from 1000ms to 100ms for faster cleanup
+				} catch (e) {
+					// Process might already be dead
+				}
+			}
+		};
+
+		// Handle abort signal
+		const abortHandler = () => {
+			console.log(`[ABORT] Abort signal received, killing child process PID ${child.pid}`);
+			cleanup();
+			if (!settled) {
+				settled = true;
+				const abortError = new Error('The operation was aborted.');
+				abortError.name = 'AbortError';
+				reject(abortError);
+			}
+		};
+
+		if (options.signal) {
+			if (options.signal.aborted) {
+				console.log(`[ABORT] Signal already aborted before starting command`);
+				abortHandler();
+				return;
+			}
+			options.signal.addEventListener('abort', abortHandler, { once: true });
+			console.log(`[ABORT] Abort listener registered for command: ${command} ${args.join(' ')}`);
+		}
 
 		child.stdout?.setEncoding('utf-8');
 		child.stderr?.setEncoding('utf-8');
@@ -167,10 +270,19 @@ async function runCommand(command: string, args: string[], options: RunOptions):
 		});
 
 		child.on('error', (error) => {
+			settled = true;
+			if (options.signal) {
+				options.signal.removeEventListener('abort', abortHandler);
+			}
 			reject(error);
 		});
 
 		child.on('close', (code) => {
+			settled = true;
+			if (options.signal) {
+				options.signal.removeEventListener('abort', abortHandler);
+			}
+
 			if (code === 0) {
 				resolve(stdout.trim());
 				return;
@@ -208,53 +320,164 @@ async function ensureFullClone(
 	signal?: AbortSignal
 ): Promise<void> {
 	throwIfAborted(signal);
+
+	// Skip network operations for now - just work with what we have locally
+	onProgress?.({ type: 'status', message: 'Using local repository data (skipping fetch)...' });
+	return;
+
 	const fetchArgs = ['fetch', '--progress', '--all', '--tags'];
-	onProgress?.({ type: 'status', message: 'Fetching remote references...' });
-	await runCommand('git', fetchArgs, {
-		cwd: repoPath,
-		...createGitProgressHandlers('git fetch --all --tags', onProgress),
-		signal
+	onProgress?.({ type: 'status', message: 'Fetching remote references (timeout in 15s)...' });
+
+	let lastCountdown = -1;
+	const fetchProgressCallback = (remaining: number) => {
+		if (remaining !== lastCountdown) {
+			lastCountdown = remaining;
+			onProgress?.({
+				type: 'status',
+				message: `Fetching remote references (timeout in ${remaining}s)...`
+			});
+		}
+	};
+
+	// Create a timeout-specific abort controller linked to parent signal
+	const fetchController = new AbortController();
+	if (signal) {
+		if (signal.aborted) {
+			fetchController.abort();
+		} else {
+			signal.addEventListener('abort', () => fetchController.abort(), { once: true });
+		}
+	}
+
+	const fetchResult = await withTimeoutAndAbort({
+		promise: runCommand('git', fetchArgs, {
+			cwd: repoPath,
+			...createGitProgressHandlers('git fetch --all --tags', onProgress),
+			signal: fetchController.signal
+		}),
+		timeoutMs: 5000, // Reduced to 5 seconds for faster debugging
+		defaultValue: 'TIMEOUT' as const,
+		controller: fetchController,
+		onProgress: fetchProgressCallback
 	});
+
+	if (fetchResult === 'TIMEOUT') {
+		onProgress?.({
+			type: 'status',
+			message: 'Fetch operation timed out - continuing with existing refs...'
+		});
+	}
 
 	throwIfAborted(signal);
 	const isShallow = await runCommand('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoPath, signal });
 	if (isShallow === 'true') {
-		onProgress?.({ type: 'status', message: 'Expanding shallow clone...' });
-		await runCommand('git', ['fetch', '--progress', '--unshallow'], {
-			cwd: repoPath,
-			...createGitProgressHandlers('git fetch --unshallow', onProgress),
-			signal
+		onProgress?.({ type: 'status', message: 'Expanding shallow clone (timeout in 15s)...' });
+
+		lastCountdown = -1;
+		const unshallowProgressCallback = (remaining: number) => {
+			if (remaining !== lastCountdown) {
+				lastCountdown = remaining;
+				onProgress?.({
+					type: 'status',
+					message: `Expanding shallow clone (timeout in ${remaining}s)...`
+				});
+			}
+		};
+
+		// Create a timeout-specific abort controller linked to parent signal
+		const unshallowController = new AbortController();
+		if (signal) {
+			if (signal.aborted) {
+				unshallowController.abort();
+			} else {
+				signal.addEventListener('abort', () => unshallowController.abort(), { once: true });
+			}
+		}
+
+		const unshallowResult = await withTimeoutAndAbort({
+			promise: runCommand('git', ['fetch', '--progress', '--unshallow'], {
+				cwd: repoPath,
+				...createGitProgressHandlers('git fetch --unshallow', onProgress),
+				signal: unshallowController.signal
+			}),
+			timeoutMs: 15000,
+			defaultValue: 'TIMEOUT' as const,
+			controller: unshallowController,
+			onProgress: unshallowProgressCallback
 		});
+
+		if (unshallowResult === 'TIMEOUT') {
+			onProgress?.({
+				type: 'status',
+				message: 'Unshallow operation timed out - continuing with shallow clone...'
+			});
+		}
 	}
 }
 
 async function initialiseRepository(slug: string, options?: ContributionSummaryOptions): Promise<string> {
+	console.log(`[INIT] Starting initialiseRepository for ${slug}`);
 	throwIfAborted(options?.signal);
 	const repoPath = repoDirectoryForSlug(slug);
+	console.log(`[INIT] Repo path: ${repoPath}`);
 	const baseDir = join(homedir(), 'git');
 	await mkdir(baseDir, { recursive: true });
 
 	if (!existsSync(repoPath)) {
+		console.log(`[INIT] Repo doesn't exist, cloning...`);
 		const cloneUrl = `${GITHUB_BASE_URL}/${slug}.git`;
-		options?.onProgress?.({ type: 'status', message: `Cloning ${slug} for the first time...` });
-		await runCommand('git', ['clone', '--progress', '--no-tags', cloneUrl, repoPath], {
-			cwd: baseDir,
-			...createGitProgressHandlers(`git clone ${slug}`, options?.onProgress),
-			signal: options?.signal
+		options?.onProgress?.({ type: 'status', message: `Cloning ${slug} (timeout in 15s)...` });
+
+		let lastCountdown = -1;
+		const cloneProgressCallback = (remaining: number) => {
+			if (remaining !== lastCountdown) {
+				lastCountdown = remaining;
+				options?.onProgress?.({
+					type: 'status',
+					message: `Cloning ${slug} (timeout in ${remaining}s)...`
+				});
+			}
+		};
+
+		// Create a timeout-specific abort controller linked to parent signal
+		const cloneController = new AbortController();
+		if (options?.signal) {
+			if (options.signal.aborted) {
+				cloneController.abort();
+			} else {
+				options.signal.addEventListener('abort', () => cloneController.abort(), { once: true });
+			}
+		}
+
+		const cloneResult = await withTimeoutAndAbort({
+			promise: runCommand('git', ['clone', '--progress', '--no-tags', cloneUrl, repoPath], {
+				cwd: baseDir,
+				...createGitProgressHandlers(`git clone ${slug}`, options?.onProgress),
+				signal: cloneController.signal
+			}),
+			timeoutMs: 15000,
+			defaultValue: 'TIMEOUT' as const,
+			controller: cloneController,
+			onProgress: cloneProgressCallback
 		});
+
+		if (cloneResult === 'TIMEOUT') {
+			throw new Error(`Clone operation timed out after 15 seconds. Repository ${slug} may be too large. Try a smaller repository.`);
+		}
+
 		options?.onProgress?.({ type: 'status', message: 'Clone complete.' });
+	} else {
+		console.log(`[INIT] Repo exists at ${repoPath}`);
 	}
 
+	console.log(`[INIT] About to call ensureFullClone`);
 	throwIfAborted(options?.signal);
 	await ensureFullClone(repoPath, options?.onProgress, options?.signal);
-	options?.onProgress?.({ type: 'status', message: 'Fast-forwarding to latest default branch...' });
-	await runCommand('git', ['pull', '--progress', '--ff-only'], {
-		cwd: repoPath,
-		allowFailure: true,
-		...createGitProgressHandlers('git pull --ff-only', options?.onProgress),
-		signal: options?.signal
-	});
-	options?.onProgress?.({ type: 'status', message: 'Repository up to date.' });
+	console.log(`[INIT] ensureFullClone returned`);
+
+	// Skip git pull for now - just use local data
+	options?.onProgress?.({ type: 'status', message: 'Repository ready (using local data).' });
+	console.log(`[INIT] Returning repo path: ${repoPath}`);
 
 	return repoPath;
 }
@@ -275,17 +498,27 @@ async function resolveCommitWindow(
 	}
 
 	throwIfAborted(signal);
-	const chronologicalOutput = await runCommand(
+	// Use git rev-list to find root commits (initial commits) more efficiently
+	const rootCommitsOutput = await runCommand(
 		'git',
-		['log', '--format=%ad', '--date=iso-strict', '--reverse'],
+		['rev-list', '--max-parents=0', 'HEAD', '--date-order'],
 		{ cwd: repoPath, signal }
 	);
 
-	const earliestCommitOutput =
-		chronologicalOutput
-			.split('\n')
-			.map((line) => line.trim())
-			.find(Boolean) ?? latestCommitOutput;
+	const rootCommitSha = rootCommitsOutput
+		.split('\n')
+		.map((line) => line.trim())
+		.find(Boolean);
+
+	let earliestCommitOutput = latestCommitOutput;
+	if (rootCommitSha) {
+		const rootCommitDate = await runCommand(
+			'git',
+			['log', '--format=%ad', '--date=iso-strict', '--max-count=1', rootCommitSha],
+			{ cwd: repoPath, signal }
+		);
+		earliestCommitOutput = rootCommitDate || latestCommitOutput;
+	}
 
 	const firstCommit = new Date(earliestCommitOutput);
 	const lastCommit = new Date(latestCommitOutput);
@@ -614,20 +847,187 @@ function determineInterval(firstCommit: Date, lastCommit: Date): AggregationInte
 	return duration < ONE_YEAR_MS ? 'month' : 'year';
 }
 
+interface TimeoutWithAbortOptions<T> {
+	promise: Promise<T>;
+	timeoutMs: number;
+	defaultValue: T;
+	controller: AbortController; // Changed from signal to controller so we can abort it
+	onProgress?: (remaining: number) => void;
+}
+
+async function withTimeoutAndAbort<T>(options: TimeoutWithAbortOptions<T>): Promise<T> {
+	const { promise, timeoutMs, defaultValue, controller, onProgress } = options;
+	const startTime = Date.now();
+	let timeout: NodeJS.Timeout | undefined;
+	let progressTimeout: NodeJS.Timeout | undefined;
+
+	const timeoutPromise = new Promise<T>((resolve) => {
+		timeout = setTimeout(() => {
+			console.log(`[TIMEOUT] Firing timeout after ${timeoutMs}ms, aborting controller...`);
+			// Abort the controller passed from the caller
+			controller.abort();
+			console.log(`[TIMEOUT] Controller aborted, resolving with default value`);
+			resolve(defaultValue);
+		}, timeoutMs);
+	});
+
+	const progress = () => {
+		if (onProgress) {
+			const elapsed = Date.now() - startTime;
+			if (elapsed < timeoutMs) {
+				const remaining = Math.max(0, Math.ceil((timeoutMs - elapsed) / 1000));
+				onProgress(remaining);
+				progressTimeout = setTimeout(progress, 1000);
+			} else {
+				onProgress(0);
+			}
+		}
+	};
+
+	if (onProgress) {
+		progress();
+	}
+
+	return Promise.race([promise, timeoutPromise]).finally(() => {
+		if (timeout) clearTimeout(timeout);
+		if (progressTimeout) clearTimeout(progressTimeout);
+	});
+}
+
+async function withTimeout<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+	defaultValue: T,
+	onProgress?: (remaining: number) => void
+): Promise<T> {
+	// For backward compatibility, create a temporary controller (but this won't actually work for killing processes)
+	const tempController = new AbortController();
+	return withTimeoutAndAbort({ promise, timeoutMs, defaultValue, controller: tempController, onProgress });
+}
+
+async function getCloneDepth(
+	repoPath: string,
+	signal?: AbortSignal,
+	onProgress?: (remaining: number) => void
+): Promise<number | null> {
+	try {
+		const output = await withTimeout(
+			runCommand('git', ['rev-list', '--count', '--all'], {
+				cwd: repoPath,
+				allowFailure: true,
+				signal
+			}),
+			15000,
+			'',
+			onProgress
+		);
+		const count = Number.parseInt(output, 10);
+		return Number.isNaN(count) ? null : count;
+	} catch {
+		return null;
+	}
+}
+
+async function getDiskSize(
+	repoPath: string,
+	signal?: AbortSignal,
+	onProgress?: (remaining: number) => void
+): Promise<number | null> {
+	try {
+		const parentDir = dirname(repoPath);
+		const output = await withTimeout(
+			runCommand('du', ['-sk', repoPath], {
+				cwd: parentDir,
+				allowFailure: true,
+				signal
+			}),
+			15000,
+			'',
+			onProgress
+		);
+		const match = output.match(/^(\d+)/);
+		if (!match) {
+			return null;
+		}
+		// du -sk returns size in kilobytes, convert to bytes
+		return Number.parseInt(match[1], 10) * 1024;
+	} catch {
+		return null;
+	}
+}
+
+async function getRepoDescription(
+	slug: string,
+	signal?: AbortSignal,
+	onProgress?: (remaining: number) => void
+): Promise<string | undefined> {
+	try {
+		const response = await withTimeout(
+			fetch(`https://api.github.com/repos/${slug}`, {
+				headers: githubRequestHeaders(),
+				signal
+			}),
+			15000,
+			null as any,
+			onProgress
+		);
+		if (!response || !response.ok) {
+			return undefined;
+		}
+		const data = (await response.json()) as { description?: string | null };
+		return data.description ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function deleteRepositoryClone(slug: string): Promise<void> {
+	const repoPath = repoDirectoryForSlug(slug);
+	const { rm } = await import('node:fs/promises');
+	await rm(repoPath, { recursive: true, force: true });
+}
+
 export async function collectContributionSummary(
 	slug: string,
 	limit: number,
 	options?: ContributionSummaryOptions
 ): Promise<RepoContributionSummary> {
+	console.log(`[COLLECT] Starting collectContributionSummary for ${slug}, limit=${limit}`);
 	if (limit <= 0) {
 		throw new Error('The number of contributors to display must be greater than 0.');
 	}
 
 	throwIfAborted(options?.signal);
+	console.log(`[COLLECT] About to send progress message for ${slug}`);
 	options?.onProgress?.({ type: 'status', message: `Preparing repository data for ${slug}...` });
+	console.log(`[COLLECT] Calling initialiseRepository for ${slug}`);
 	const repoPath = await initialiseRepository(slug, options);
+	console.log(`[COLLECT] initialiseRepository returned: ${repoPath}`);
 	throwIfAborted(options?.signal);
+	console.log(`[COLLECT] Calling resolveCommitWindow for ${slug}`);
 	const { firstCommit, lastCommit } = await resolveCommitWindow(repoPath, options?.signal);
+	console.log(`[COLLECT] resolveCommitWindow returned for ${slug}`);
+	const firstCommitIso = firstCommit.toISOString();
+	const lastCommitIso = lastCommit.toISOString();
+	const cacheKey = summaryCacheKey(slug, limit);
+	const cachedSummaryEntry = await summaryStore.get(cacheKey).catch(() => undefined);
+	const cachedValue = cachedSummaryEntry?.value;
+	if (
+		cachedValue &&
+		cachedValue.slug === slug &&
+		cachedValue.limit === limit &&
+		cachedValue.summary.startDate === firstCommitIso &&
+		cachedValue.summary.endDate === lastCommitIso
+	) {
+		options?.onProgress?.({
+			type: 'status',
+			message: 'Using cached contributor summary.'
+		});
+		return {
+			...cachedValue.summary,
+			repoPath
+		};
+	}
 	const interval = determineInterval(firstCommit, lastCommit);
 	const periodDefinitions =
 		interval === 'year'
@@ -651,32 +1051,57 @@ export async function collectContributionSummary(
 	>();
 
 	const progressStride = Math.max(1, Math.ceil(periodDefinitions.length / 10));
+	const canReuseCached = Boolean(cachedValue && cachedValue.summary.interval === interval);
+	const cachedPeriodsByLabel = new Map<string, PeriodContributor[]>();
+	if (canReuseCached && cachedValue) {
+		for (const cachedPeriod of cachedValue.summary.periods) {
+			cachedPeriodsByLabel.set(cachedPeriod.label, cachedPeriod.contributors);
+		}
+	}
+	const lastPeriodLabel =
+		periodDefinitions.length > 0 ? periodDefinitions[periodDefinitions.length - 1]?.label ?? null : null;
 
 	for (const [index, period] of periodDefinitions.entries()) {
 		throwIfAborted(options?.signal);
-		const output = await runCommand(
-			'git',
-			[
-				'shortlog',
-				'-s',
-				'-n',
-				'--all',
-				'--no-merges',
-				'--email',
-				`--since=${period.start}`,
-				`--until=${period.end}`
-			],
-			{ cwd: repoPath, signal: options?.signal }
-		);
+		let contributors: PeriodContributor[] | undefined;
+		let reusedPeriod = false;
 
-		const contributors = parseShortlog(output, limit);
+		if (canReuseCached && cachedPeriodsByLabel.has(period.label) && period.label !== lastPeriodLabel) {
+			const cachedContributors = cachedPeriodsByLabel.get(period.label);
+			if (cachedContributors) {
+				contributors = cachedContributors.map((entry) => ({ ...entry }));
+				reusedPeriod = true;
+			}
+		}
+
+		if (!contributors) {
+			const output = await runCommand(
+				'git',
+				[
+					'shortlog',
+					'-s',
+					'-n',
+					'--all',
+					'--no-merges',
+					'--email',
+					`--since=${period.start}`,
+					`--until=${period.end}`
+				],
+				{ cwd: repoPath, signal: options?.signal }
+			);
+
+			contributors = parseShortlog(output, limit);
+		}
+
 		const periodRecord = { ...period, contributors };
 		periods.push(periodRecord);
 		const periodIndex = periods.length - 1;
 		if ((index + 1) % progressStride === 0 || index === periodDefinitions.length - 1) {
 			options?.onProgress?.({
 				type: 'status',
-				message: `Processed ${index + 1} of ${periodDefinitions.length} periods`
+				message: reusedPeriod
+					? `Reused cached data for ${index + 1} of ${periodDefinitions.length} periods`
+					: `Processed ${index + 1} of ${periodDefinitions.length} periods`
 			});
 		}
 
@@ -716,13 +1141,20 @@ export async function collectContributionSummary(
 		}
 	}
 
-	if (pendingProfileLookups.size > 0) {
+	console.log(`[COLLECT] Profile lookups needed: ${pendingProfileLookups.size} for ${slug}`);
+
+	// DISABLED: This profile lookup makes hundreds of sequential GitHub API calls
+	// which causes hangs and rate limiting. Skip it entirely for now.
+	// TODO: Implement batched/parallel profile lookups with rate limiting
+	if (false && pendingProfileLookups.size > 0) {
+		console.log(`[COLLECT] Starting fetchProfilesForEmails for ${slug}`);
 		const resolvedProfiles = await fetchProfilesForEmails(
 			slug,
 			repoPath,
 			pendingProfileLookups,
 			options?.signal
 		);
+		console.log(`[COLLECT] fetchProfilesForEmails completed for ${slug}`);
 
 		for (const [normalizedEmail, profileUrl] of resolvedProfiles) {
 			const lookup = pendingProfileLookups.get(normalizedEmail);
@@ -745,6 +1177,7 @@ export async function collectContributionSummary(
 			}
 		}
 	}
+	console.log(`[COLLECT] Skipped profile lookups, continuing with summary generation for ${slug}`);
 
 	const series: ContributorSeries[] = Array.from(contributorMap.values())
 		.map((entry) => {
@@ -763,13 +1196,45 @@ export async function collectContributionSummary(
 
 	options?.onProgress?.({ type: 'status', message: 'Contributor statistics ready.' });
 
-	return {
+	// Gather repository metadata
+	throwIfAborted(options?.signal);
+	options?.onProgress?.({ type: 'status', message: 'Gathering repository metadata...' });
+
+	let lastCountdown = -1;
+	const progressCallback = (remaining: number) => {
+		if (remaining !== lastCountdown) {
+			lastCountdown = remaining;
+			options?.onProgress?.({
+				type: 'status',
+				message: `Gathering repository metadata (timeout in ${remaining}s)...`
+			});
+		}
+	};
+
+	const [description, cloneDepth, diskSize] = await Promise.all([
+		getRepoDescription(slug, options?.signal, progressCallback),
+		getCloneDepth(repoPath, options?.signal, progressCallback),
+		getDiskSize(repoPath, options?.signal, progressCallback)
+	]);
+
+	const finalSummary: RepoContributionSummary = {
 		slug,
 		repoPath,
+		description,
+		cloneDepth,
+		diskSize,
 		interval,
-		startDate: firstCommit.toISOString(),
-		endDate: lastCommit.toISOString(),
+		startDate: firstCommitIso,
+		endDate: lastCommitIso,
 		periods,
 		series
 	};
+
+	await summaryStore
+		.set(cacheKey, { slug, limit, summary: sanitizeSummary(finalSummary) })
+		.catch(() => {
+			// ignore cache persistence failures
+		});
+
+	return finalSummary;
 }

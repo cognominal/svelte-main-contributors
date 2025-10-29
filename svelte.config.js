@@ -9,6 +9,12 @@ const config = {
 	preprocess: vitePreprocess(),
 	kit: {
 		adapter: adapter()
+	},
+	vitePlugin: {
+		inspector: {
+			toggleKeyCombo: 'control-shift',
+			holdMode: false,
+		}
 	}
 };
 

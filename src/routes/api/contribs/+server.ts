@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { collectContributionSummary, type ProgressEvent } from '$lib/server/gitStats';
+import { collectContributionSummary, getCachedContributionSummary, deleteRepositoryClone, type ProgressEvent } from '$lib/server/gitStats';
 import type { RepoContributionSummary } from '$lib/types';
 import type { RequestHandler } from './$types';
 
@@ -12,12 +12,12 @@ interface RequestPayload {
 }
 
 function serializeSummary(summary: RepoContributionSummary) {
-	const { slug, interval, startDate, endDate, periods, series } = summary;
+	const { slug, description, cloneDepth, diskSize, interval, startDate, endDate, periods, series } = summary;
 	const sanitizedPeriods = periods.map((period) => ({
 		...period,
 		contributors: period.contributors.map(({ email: _email, ...rest }) => rest)
 	}));
-	return { slug, interval, startDate, endDate, periods: sanitizedPeriods, series };
+	return { slug, description, cloneDepth, diskSize, interval, startDate, endDate, periods: sanitizedPeriods, series };
 }
 
 function filterBotContributors(summary: RepoContributionSummary): RepoContributionSummary {
@@ -88,13 +88,26 @@ return (payload.items ?? [])
 		.slice(0, count);
 }
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ request, cookies }) => {
 	const body = (await request.json()) as RequestPayload;
 	const owner = body.owner?.trim();
 	const repo = body.repo?.trim();
 	const limit = Number(body.limit ?? 5);
 	const excludeBots = body.excludeBots === true;
 	const topStarred = body.topStarred === true;
+
+	// Store query in cookie for session persistence
+	cookies.set('contribs_query', JSON.stringify({
+		owner,
+		repo: topStarred ? null : repo,
+		limit,
+		excludeBots,
+		topStarred
+	}), {
+		path: '/',
+		maxAge: 60 * 60 * 24 * 30, // 30 days
+		sameSite: 'lax'
+	});
 
 	if (!Number.isFinite(limit) || limit <= 0) {
 		return json({ error: 'The contributor limit must be a positive integer.' }, { status: 400 });
@@ -182,6 +195,26 @@ export const POST: RequestHandler = async ({ request }) => {
 
 const collected: RepoContributionSummary[] = [];
 							for (const [index, currentSlug] of slugs.entries()) {
+								try {
+									const cachedSummary = await getCachedContributionSummary(currentSlug, limit);
+									if (cachedSummary) {
+										const cachedFinal = excludeBots ? filterBotContributors(cachedSummary) : cachedSummary;
+										collected[index] = cachedFinal;
+										send({
+											type: 'status',
+											message: `Loaded cached summary for ${currentSlug}. Refreshing...`
+										});
+										send({
+											type: 'partial',
+											index,
+											total: slugs.length,
+											summary: serializeSummary(cachedFinal),
+											description: repoSummaries[index]?.description ?? null
+										});
+									}
+								} catch {
+									// Ignore cache read errors, proceed with fresh computation
+								}
 								send({
 									type: 'status',
 									message: `Processing ${currentSlug} (${index + 1}/${slugs.length})`
@@ -230,6 +263,23 @@ const summary = await collectContributionSummary(currentSlug, limit, {
 				'Cache-Control': 'no-cache'
 			}
 		});
+	} catch (error) {
+		return json({ error: (error as Error).message }, { status: 500 });
+	}
+};
+
+export const DELETE: RequestHandler = async ({ request }) => {
+	try {
+		const body = (await request.json()) as { slug?: string };
+		const slug = body.slug?.trim();
+
+		if (!slug) {
+			return json({ error: 'Repository slug is required.' }, { status: 400 });
+		}
+
+		await deleteRepositoryClone(slug);
+
+		return json({ success: true, message: `Clone of ${slug} deleted.` });
 	} catch (error) {
 		return json({ error: (error as Error).message }, { status: 500 });
 	}

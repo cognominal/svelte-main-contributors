@@ -3,9 +3,26 @@
   import { fade } from "svelte/transition";
   import { tick, onMount, onDestroy } from "svelte";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
+  import type { PageData } from "./$types";
+  import {
+    fetchJSON,
+    validateGitHubUser,
+    validateGitHubRepo,
+    searchGitHubUsers,
+    searchGitHubRepos
+  } from "$lib/client/github-api";
+
+  interface Props {
+    data: PageData;
+  }
+
+  let { data }: Props = $props();
 
   interface SummaryPayload {
     slug: string;
+    description?: string;
+    cloneDepth: number | null;
+    diskSize: number | null;
     interval: AggregationInterval;
     startDate: string;
     endDate: string;
@@ -23,9 +40,11 @@
     }>;
   }
 
-  let owner = $state("");
-  let repo = $state("");
-  let limit = $state(5);
+  // Initialize from saved query or defaults
+  let owner = $state(data.savedQuery?.owner ?? "");
+  let repo = $state(data.savedQuery?.repo ?? "");
+  let limit = $state(data.savedQuery?.limit ?? 5);
+  let excludeBots = $state(data.savedQuery?.excludeBots ?? true);
   let loading = $state(false);
   let errorMessage = $state("");
   let summaries = $state<SummaryPayload[]>([]);
@@ -42,7 +61,6 @@
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
   let highlightedContributor = $state<string | null>(null);
-  let excludeBots = $state(true);
   let chartStrip = $state<HTMLDivElement | null>(null);
   let pointerDragging = $state(false);
   let pointerDrag: { id: number; startX: number; scrollLeft: number } | null = null;
@@ -63,9 +81,9 @@
   let chartCardElements = $state<Array<HTMLElement | null>>([]);
   let thumbnailUrls = $state<Array<string | null>>([]);
   let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>([]);
-  let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number; availableBytes: number } | null>(null);
-  let storageStatus = $state<"idle" | "loading" | "error" | "ready">("idle");
-  let storageError = $state<string | null>(null);
+  let storageInfo = $state(data.storageInfo);
+  let storageStatus = $state<"error" | "ready">(data.storageInfo ? "ready" : "error");
+  let storageError = $state<string | null>(data.storageInfo ? null : "Unable to load storage information.");
   const GITHUB_BASE_URL = "https://github.com";
   let ownerSuggestionAbort: AbortController | null = null;
   let repoSuggestionAbort: AbortController | null = null;
@@ -926,20 +944,23 @@
     }
   }
 
+  async function processThumbnailQueue(startIndex = 0) {
+    for (let index = startIndex; index < filteredSummaries.length; index += 1) {
+      if (thumbnailStatus[index] === "idle" && chartCardElements[index]) {
+        const nextStatus = [...thumbnailStatus];
+        nextStatus[index] = "pending";
+        thumbnailStatus = nextStatus;
+        await captureThumbnail(index);
+        // Yield to the event loop after each thumbnail
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+  }
+
   $effect(() => {
     filteredSummaries;
     chartCardElements;
-    (async () => {
-      await tick();
-      for (let index = 0; index < filteredSummaries.length; index += 1) {
-        if (thumbnailStatus[index] === "idle" && chartCardElements[index]) {
-          const nextStatus = [...thumbnailStatus];
-          nextStatus[index] = "pending";
-          thumbnailStatus = nextStatus;
-          await captureThumbnail(index);
-        }
-      }
-    })().catch((error) => console.error(error));
+    void processThumbnailQueue();
   });
 
   function handlePointerUp(event: PointerEvent) {
@@ -976,20 +997,6 @@
     repoSuggestionIndex = -1;
   }
 
-  async function fetchJSON<T>(url: string, signal: AbortSignal): Promise<T> {
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json"
-    };
-    if (import.meta.env.VITE_GITHUB_TOKEN) {
-      headers.Authorization = `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`;
-    }
-
-    const response = await fetch(url, { headers, signal });
-    if (!response.ok) {
-      throw new Error(`GitHub request failed (${response.status})`);
-    }
-    return (await response.json()) as T;
-  }
 
   function handleOwnerInput(event: Event) {
     const value = (event.currentTarget as HTMLInputElement).value.trim();
@@ -1030,13 +1037,7 @@
     const controller = new AbortController();
     ownerSuggestionAbort = controller;
     try {
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ login: string }>;
-      }>(
-        `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
-        controller.signal
-      );
+      const data = await searchGitHubUsers(query, controller.signal);
       ownerSuggestions = data.items.map((item) => item.login);
       ownerSuggestionIndex = -1;
       ownerSuggestionNote = data.total_count > 20 ? "Type more characters to refine results." : null;
@@ -1205,13 +1206,7 @@
     const controller = new AbortController();
     repoSuggestionAbort = controller;
     try {
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ name: string; full_name: string }>;
-      }>(
-        `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${ownerLogin} ${prefix} in:name`)}&per_page=20`,
-        controller.signal
-      );
+      const data = await searchGitHubRepos(ownerLogin, prefix, controller.signal);
       repoSuggestions = data.items
         .filter((item) => item.full_name.startsWith(`${ownerLogin}/`))
         .map((item) => item.name);
@@ -1347,30 +1342,7 @@
     return `${display}${units[exponent]}`;
   }
 
-  async function loadStorageInfo() {
-    if (storageStatus === "loading") {
-      return;
-    }
-    storageStatus = "loading";
-    storageError = null;
-    try {
-      const response = await fetch("/api/storage");
-      if (!response.ok) {
-        throw new Error(`Request failed with status ${response.status}`);
-      }
-      const data = (await response.json()) as {
-        gitBytes: number;
-        usedBytes: number;
-        totalBytes: number;
-        availableBytes: number;
-      };
-      storageInfo = data;
-      storageStatus = "ready";
-    } catch (error) {
-      storageStatus = "error";
-      storageError = error instanceof Error ? error.message : "Unable to load storage information.";
-    }
-  }
+
 
   function chartRef(node: HTMLElement, index: number) {
     let currentIndex = index;
@@ -1411,21 +1383,9 @@
     ownerValidationAbort = controller;
     ownerValidationState = "pending";
     try {
-      const response = await fetch(`https://api.github.com/users/${login}`, {
-        signal: controller.signal,
-        headers: import.meta.env.VITE_GITHUB_TOKEN
-          ? {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
-            }
-          : { Accept: "application/vnd.github+json" }
-      });
-      if (!response.ok) {
-        ownerValidationState = "invalid";
-        return false;
-      }
-      ownerValidationState = "valid";
-      return true;
+      const isValid = await validateGitHubUser(login, controller.signal);
+      ownerValidationState = isValid ? "valid" : "invalid";
+      return isValid;
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         return false;
@@ -1451,21 +1411,9 @@
     repoValidationAbort = controller;
     repoValidationState = "pending";
     try {
-      const response = await fetch(`https://api.github.com/repos/${login}/${repoValue}`, {
-        signal: controller.signal,
-        headers: import.meta.env.VITE_GITHUB_TOKEN
-          ? {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
-            }
-          : { Accept: "application/vnd.github+json" }
-      });
-      if (!response.ok) {
-        repoValidationState = "invalid";
-        return false;
-      }
-      repoValidationState = "valid";
-      return true;
+      const isValid = await validateGitHubRepo(login, repoValue, controller.signal);
+      repoValidationState = isValid ? "valid" : "invalid";
+      return isValid;
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         return false;
@@ -1480,7 +1428,10 @@
   }
 
   onMount(() => {
-    void loadStorageInfo();
+
+
+
+
     const handleGlobalPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (
@@ -1753,30 +1704,77 @@
   {#if filteredSummaries.length > 0}
     <div class="thumbnail-strip" aria-label="Chart thumbnails">
       {#each filteredSummaries as summary, index}
-        <button
-          type="button"
-          class="thumbnail"
-          class:active={index === selectedIndex}
-          onclick={() => {
-            cancelSnapRestore();
-            stopScrollAnimation();
-            snapEnabled = false;
-            selectedIndex = index;
-            requestAnimationFrame(() => {
-              scrollToCard(index).catch(() => {});
-            });
-          }}
-          aria-label={`Show ${summary.slug}`}
-        >
-          <span class="thumbnail__label">{repositoryName(summary.slug)}</span>
-          {#if thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
-            <img src={thumbnailUrls[index] ?? ""} alt={`Preview of ${summary.slug}`} />
-          {:else if thumbnailStatus[index] === "pending"}
-            <span class="thumbnail__placeholder">Rendering…</span>
-          {:else}
-            <span class="thumbnail__placeholder">Preview unavailable</span>
-          {/if}
-        </button>
+        <div class="thumbnail-container">
+          <button
+            type="button"
+            class="thumbnail"
+            class:active={index === selectedIndex}
+            onclick={() => {
+              cancelSnapRestore();
+              stopScrollAnimation();
+              snapEnabled = false;
+              selectedIndex = index;
+              requestAnimationFrame(() => {
+                scrollToCard(index).catch(() => {});
+              });
+            }}
+            aria-label={`Show ${summary.slug}`}
+          >
+            <span class="thumbnail__label">{repositoryName(summary.slug)}</span>
+            {#if thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
+              <img src={thumbnailUrls[index] ?? ""} alt={`Preview of ${summary.slug}`} />
+            {:else if thumbnailStatus[index] === "pending"}
+              <span class="thumbnail__placeholder">Rendering…</span>
+            {:else}
+              <span class="thumbnail__placeholder">Preview unavailable</span>
+            {/if}
+          </button>
+          <div class="thumbnail-info">
+            {#if summary.description}
+              <p class="thumbnail-info__description">{summary.description}</p>
+            {/if}
+            <p class="thumbnail-info__status">
+              {#if summary.cloneDepth !== null}
+                <span>Depth: {summary.cloneDepth.toLocaleString()} commits</span>
+                {#if summary.diskSize !== null}
+                  <span>Size: {formatBytes(summary.diskSize)}</span>
+                {/if}
+              {:else}
+                <span class="thumbnail-info__not-cloned">Not cloned</span>
+              {/if}
+            </p>
+            {#if summary.cloneDepth !== null}
+              <button
+                type="button"
+                class="thumbnail-info__delete"
+                onclick={async (e) => {
+                  e.stopPropagation();
+                  if (!confirm(`Delete clone of ${summary.slug}?\n\nCached contribution data will be preserved.`)) {
+                    return;
+                  }
+                  try {
+                    const response = await fetch('/api/contribs', {
+                      method: 'DELETE',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ slug: summary.slug })
+                    });
+                    if (!response.ok) {
+                      throw new Error('Failed to delete clone');
+                    }
+                    // Refresh the summary to update clone status
+                    summary.cloneDepth = null;
+                    summary.diskSize = null;
+                  } catch (error) {
+                    alert(`Failed to delete clone: ${(error as Error).message}`);
+                  }
+                }}
+                aria-label={`Delete clone of ${summary.slug}`}
+              >
+                Delete Clone
+              </button>
+            {/if}
+          </div>
+        </div>
       {/each}
     </div>
   {/if}
@@ -2243,6 +2241,67 @@
     margin-top: 1.5rem;
     background: rgba(248, 250, 252, 0.9);
     border-radius: 0.5rem;
+  }
+
+  .thumbnail-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .thumbnail-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+    color: #475569;
+    padding: 0 0.25rem;
+    max-width: 9.5rem;
+  }
+
+  .thumbnail-info__description {
+    margin: 0;
+    line-height: 1.3;
+    max-height: 2.6em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .thumbnail-info__status {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    font-size: 0.7rem;
+  }
+
+  .thumbnail-info__not-cloned {
+    color: #94a3b8;
+    font-style: italic;
+  }
+
+  .thumbnail-info__delete {
+    margin-top: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: #fff;
+    background: #dc2626;
+    border: none;
+    border-radius: 0.25rem;
+    cursor: pointer;
+    transition: background 0.2s ease;
+  }
+
+  .thumbnail-info__delete:hover {
+    background: #b91c1c;
+  }
+
+  .thumbnail-info__delete:active {
+    background: #991b1b;
   }
 
   .chart-card {

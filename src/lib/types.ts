@@ -17,6 +17,9 @@ export interface ContributorSeries {
 export interface RepoContributionSummary {
 	slug: string;
 	repoPath: string;
+	description?: string;
+	cloneDepth: number | null;
+	diskSize: number | null;
 	interval: AggregationInterval;
 	startDate: string;
 	endDate: string;
