@@ -20,6 +20,7 @@ It ships with a web UI for browsing contribution to chart the top contributors p
 
 - [CACHING.md](CACHING.md) &mdash; caching mechanism and performance
 - [GITHUB.md](GITHUB.md) &mdash; GitHub API usage and endpoints
+- [THUMBNAILS.md](THUMBNAILS.md) &mdash; thumbnail generation process
 
 ## Prerequisites
 

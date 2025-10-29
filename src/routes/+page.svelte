@@ -857,14 +857,29 @@
     clone.setAttribute("width", `${sourceWidth}`);
     clone.setAttribute("height", `${sourceHeight}`);
 
-    const backgroundColor = resolveBackgroundColor(host);
+    // Add white background
     const background = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     background.setAttribute("x", "0");
     background.setAttribute("y", "0");
     background.setAttribute("width", `${sourceWidth}`);
     background.setAttribute("height", `${sourceHeight}`);
-    background.setAttribute("fill", backgroundColor);
+    background.setAttribute("fill", "#ffffff");
     clone.insertBefore(background, clone.firstChild);
+
+    // Embed CSS styles directly in the SVG so they survive serialization
+    const style = document.createElementNS("http://www.w3.org/2000/svg", "style");
+    style.textContent = `
+      .chart-bg { fill: rgba(0, 0, 0, 0.03); }
+      .axis line { stroke: #444; stroke-width: 1; }
+      .axis text { fill: #333; font-family: system-ui, sans-serif; font-size: 12px; }
+      .axis .grid { stroke: rgba(0, 0, 0, 0.06); }
+      .series path { fill: none; stroke-width: 2; }
+      .series circle { stroke: #fff; stroke-width: 1; }
+      .axis-label { fill: #444; font-family: system-ui, sans-serif; font-size: 12px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase; }
+      .legend text { fill: #333; font-family: system-ui, sans-serif; font-size: 13px; }
+      .legend-item rect { cursor: pointer; }
+    `;
+    clone.insertBefore(style, background.nextSibling);
 
     const serializer = new XMLSerializer();
     const source = serializer.serializeToString(clone);
@@ -888,7 +903,7 @@
       if (!context) {
         throw new Error("Canvas context unavailable.");
       }
-    context.fillStyle = backgroundColor;
+      context.fillStyle = "#ffffff";
       context.fillRect(0, 0, targetWidth, targetHeight);
       context.scale(scale, scale);
       context.drawImage(image, 0, 0, sourceWidth, sourceHeight);
