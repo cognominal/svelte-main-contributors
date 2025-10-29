@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createPersistentCache } from '$lib/server/cache';
 import type {
 	AggregationInterval,
 	ContributorSeries,
@@ -48,6 +49,38 @@ const GITHUB_API_VERSION = '2022-11-28';
 
 const githubProfileCache = new Map<string, string | null>();
 const githubNameCache = new Map<string, string | null>();
+const githubProfileStore = createPersistentCache<string | null>('github-profiles-by-email.json');
+const githubNameStore = createPersistentCache<string | null>('github-profiles-by-name.json');
+
+async function hydrateEmailProfileCache(normalizedEmail: string | null): Promise<void> {
+	if (!normalizedEmail || githubProfileCache.has(normalizedEmail)) {
+		return;
+	}
+	const record = await githubProfileStore.get(normalizedEmail);
+	if (record) {
+		githubProfileCache.set(normalizedEmail, record.value);
+	}
+}
+
+async function hydrateNameProfileCache(normalizedName: string | null): Promise<void> {
+	if (!normalizedName || githubNameCache.has(normalizedName)) {
+		return;
+	}
+	const record = await githubNameStore.get(normalizedName);
+	if (record) {
+		githubNameCache.set(normalizedName, record.value);
+	}
+}
+
+async function rememberEmailProfile(normalizedEmail: string, profileUrl: string | null): Promise<void> {
+	githubProfileCache.set(normalizedEmail, profileUrl);
+	await githubProfileStore.set(normalizedEmail, profileUrl);
+}
+
+async function rememberNameProfile(normalizedName: string, profileUrl: string | null): Promise<void> {
+	githubNameCache.set(normalizedName, profileUrl);
+	await githubNameStore.set(normalizedName, profileUrl);
+}
 
 function normalizeEmail(email?: string | null): string | null {
 	if (!email) {
@@ -336,19 +369,25 @@ async function lookupProfileUrlFromGitHub(
 
 	if (!normalizedEmail) {
 		if (normalizedName) {
+			await hydrateNameProfileCache(normalizedName);
+			const cachedByName = githubNameCache.get(normalizedName);
+			if (cachedByName !== undefined) {
+				return cachedByName ?? undefined;
+			}
 			return await lookupProfileUrlByName(name!, signal);
 		}
 		return undefined;
 	}
 
+	await hydrateEmailProfileCache(normalizedEmail);
 	const cached = githubProfileCache.get(normalizedEmail);
 	if (cached !== undefined) {
 		return cached ?? undefined;
 	}
 
-	const applyNameCache = (profileUrl: string | undefined) => {
+	const applyNameCache = async (profileUrl: string | undefined) => {
 		if (profileUrl && normalizedName) {
-			githubNameCache.set(normalizedName, profileUrl);
+			await rememberNameProfile(normalizedName, profileUrl);
 		}
 	};
 
@@ -356,12 +395,12 @@ async function lookupProfileUrlFromGitHub(
 		if (name) {
 			const viaName = await lookupProfileUrlByName(name, signal);
 			if (viaName) {
-				githubProfileCache.set(normalizedEmail, viaName);
-				applyNameCache(viaName);
+				await rememberEmailProfile(normalizedEmail, viaName);
+				await applyNameCache(viaName);
 				return viaName;
 			}
 		}
-		githubProfileCache.set(normalizedEmail, null);
+		await rememberEmailProfile(normalizedEmail, null);
 		return undefined;
 	};
 
@@ -410,8 +449,8 @@ async function lookupProfileUrlFromGitHub(
 			return await attemptNameFallback();
 		}
 
-		githubProfileCache.set(normalizedEmail, profileUrl);
-		applyNameCache(profileUrl);
+		await rememberEmailProfile(normalizedEmail, profileUrl);
+		await applyNameCache(profileUrl);
 		return profileUrl;
 	} catch (error) {
 		if ((error as Error)?.name === 'AbortError') {
@@ -444,6 +483,7 @@ async function lookupProfileUrlByName(name: string, signal?: AbortSignal): Promi
 		return undefined;
 	}
 
+	await hydrateNameProfileCache(normalized);
 	const cached = githubNameCache.get(normalized);
 	if (cached !== undefined) {
 		return cached ?? undefined;
@@ -460,7 +500,7 @@ async function lookupProfileUrlByName(name: string, signal?: AbortSignal): Promi
 		);
 
 		if (!response.ok) {
-			githubNameCache.set(normalized, null);
+			await rememberNameProfile(normalized, null);
 			return undefined;
 		}
 
@@ -501,24 +541,24 @@ async function lookupProfileUrlByName(name: string, signal?: AbortSignal): Promi
 			}
 			const match = await evaluateCandidate(item.login, item.html_url);
 			if (match) {
-				githubNameCache.set(normalized, match);
+				await rememberNameProfile(normalized, match);
 				return match;
 			}
 		}
 
 		if (items.length > 0 && items[0]?.login) {
-			const fallback = items[0].html_url ?? `${GITHUB_BASE_URL}/${items[0].login}`;
-			githubNameCache.set(normalized, fallback);
+				const fallback = items[0].html_url ?? `${GITHUB_BASE_URL}/${items[0].login}`;
+			await rememberNameProfile(normalized, fallback);
 			return fallback;
 		}
 
-		githubNameCache.set(normalized, null);
+		await rememberNameProfile(normalized, null);
 		return undefined;
 	} catch (error) {
 		if ((error as Error)?.name === 'AbortError') {
 			throw error;
 		}
-		githubNameCache.set(normalized, null);
+		await rememberNameProfile(normalized, null);
 		return undefined;
 	}
 }
