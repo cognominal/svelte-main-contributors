@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { createAutocomplete } from '../../autocomplete/completion.svelte';
-  import { cn } from '../../utils'; // Changed to relative path
+import { cn } from '../../utils'; // Changed to relative path
 
   interface AutocompleteInputProps {
     value: string; // Keep value as a prop
@@ -12,9 +11,6 @@
     applySuggestion: (suggestion: string) => void;
     resetSuggestions: () => void;
     handleFocus: () => void;
-    validate: (query: string) => Promise<boolean>;
-    abortSuggestions: () => void;
-    abortValidation: () => void;
     id: string;
     label: string;
     placeholder: string;
@@ -27,6 +23,8 @@
     inputEl?: HTMLInputElement | null;
     fieldEl?: HTMLDivElement | null;
     submitOnEmptyEnter?: boolean;
+    highlightMatch?: boolean;
+    suggestionsPending?: boolean;
   }
 
   let { 
@@ -39,9 +37,6 @@
     applySuggestion,
     resetSuggestions,
     handleFocus,
-    validate,
-    abortSuggestions,
-    abortValidation,
     id,
     label,
     placeholder,
@@ -54,13 +49,16 @@
     inputEl = $bindable<HTMLInputElement | null>(null),
     fieldEl = $bindable<HTMLDivElement | null>(null),
     submitOnEmptyEnter = false,
+    highlightMatch = false,
+    suggestionsPending = false,
   }: AutocompleteInputProps = $props();
+
+  const isLoading = $derived(suggestionsPending || validationState === 'pending');
 
   $effect(() => { 
     if (suggestions && value) {
       suggestionIndex = suggestions.indexOf(value);
     }
-    console.log('AutocompleteInput suggestions:', suggestions);
   });
 
   function scrollSuggestionIntoView(index: number) {
@@ -79,6 +77,7 @@
       const next = suggestionIndex + 1;
       suggestionIndex = next >= suggestions.length ? 0 : next;
       scrollSuggestionIntoView(suggestionIndex);
+      handleKeyDown(event);
       return;
     }
     if (event.key === 'ArrowUp' && suggestions.length > 0) {
@@ -86,6 +85,7 @@
       const next = suggestionIndex - 1;
       suggestionIndex = next < 0 ? suggestions.length - 1 : next;
       scrollSuggestionIntoView(suggestionIndex);
+      handleKeyDown(event);
       return;
     }
     if (event.key === 'Escape') {
@@ -125,9 +125,9 @@
   let suggestionIndex = $state(-1);
 </script>
 
-<div class={cn("field field--with-suggestions", class_)} bind:this={fieldEl}>
-  <label for={id}>{label}</label>
-  <div class="input-wrapper relative">
+<div class={cn("flex flex-col gap-2", class_)} bind:this={fieldEl}>
+  <label class="font-semibold text-sm" for={id}>{label}</label>
+  <div class="relative">
           <input
             {id}
             name={id}
@@ -138,25 +138,35 @@
             oninput={handleInput}
             onkeydown={handleLocalKeyDown}
             onfocus={handleFocus}
-            class={cn(inputClass, validationState === 'valid' && 'font-bold', 'w-full')}
+            class={cn(
+              'w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base shadow-sm transition focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200',
+              highlightMatch && 'font-bold',
+              inputClass
+            )}
             aria-invalid={validationState === 'invalid'}
+            aria-busy={isLoading ? 'true' : undefined}
             aria-expanded={ariaExpanded}
             aria-controls={ariaControls}
             aria-activedescendant={ariaActivedescendant}
-          />    {#if suggestions.length > 0 || suggestionNote}
-      <ul class="suggestions absolute top-[calc(100%+0.35rem)] left-0 right-0 list-none m-0 py-[0.35rem] border border-gray-200/10 rounded-[10px] bg-white/98 grid gap-1 shadow-lg z-10 max-h-56 overflow-y-auto" role="listbox" id={ariaControls}>
+          />
+    {#if isLoading}
+      <span class="spinner" role="status" aria-live="polite">
+        <span class="sr-only">Loading</span>
+      </span>
+    {/if}
+    {#if suggestions.length > 0 || suggestionNote}
+      <ul class="absolute left-0 right-0 z-10 mt-2 max-h-56 overflow-y-auto rounded-xl border border-slate-200 bg-white/95 p-1.5 shadow-lg" role="listbox" id={ariaControls}>
         {#each suggestions as suggestion, index}
-          {console.log('Individual suggestion:', suggestion)}
-          <li class="m-0 p-0">
+          <li>
             <button
               type="button"
               onclick={() => handleLocalApplySuggestion(suggestion)}
               role="option"
               aria-selected={index === suggestionIndex}
               class={cn(
-                "w-full text-left px-3 py-2 bg-transparent border-0 text-sm text-gray-800 cursor-pointer",
-                "hover:bg-blue-100 focus:outline-none",
-                index === suggestionIndex && "active bg-blue-100"
+                'w-full rounded-lg px-3 py-2 text-left text-sm text-slate-800 focus:outline-none',
+                'hover:bg-blue-50 focus:bg-blue-50',
+                index === suggestionIndex && 'bg-blue-100'
               )}
               id={`${id}-suggestion-${index}`}
             >
@@ -165,9 +175,45 @@
           </li>
         {/each}
         {#if suggestionNote}
-          <li class="suggestions__note text-xs text-gray-600 px-3 py-1">{suggestionNote}</li>
+          <li class="px-3 py-1 text-xs text-slate-500">{suggestionNote}</li>
         {/if}
       </ul>
     {/if}
   </div>
 </div>
+
+<style>
+  .spinner {
+    position: absolute;
+    top: 50%;
+    right: 0.75rem;
+    width: 1rem;
+    height: 1rem;
+    border-radius: 9999px;
+    border: 2px solid rgba(148, 163, 184, 0.35);
+    border-top-color: rgba(59, 130, 246, 0.9);
+    animation: spinner-rotate 0.75s linear infinite;
+    transform: translateY(-50%);
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  @keyframes spinner-rotate {
+    from {
+      transform: translateY(-50%) rotate(0deg);
+    }
+    to {
+      transform: translateY(-50%) rotate(360deg);
+    }
+  }
+</style>

@@ -1,6 +1,3 @@
-import { tick } from 'svelte';
-import { fetchJSON } from '../autocomplete';
-
 interface AutocompleteOptions {
   fetchSuggestions: (query: string, signal: AbortSignal) => Promise<{ items: any[]; total_count: number }>;
   fetchValidation: (query: string, signal: AbortSignal) => Promise<boolean>;
@@ -22,6 +19,8 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
   let suggestions = $state<string[]>([]);
   let suggestionNote = $state<string | null>(null);
   let suggestionIndex = $state(-1);
+  let suggestionsPending = $state(false);
+  let manualValue = value;
 
 
   let validationState = $state<'idle' | 'pending' | 'valid' | 'invalid'>('idle');
@@ -39,6 +38,7 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
   function abortSuggestions() {
     suggestionAbort?.abort();
     suggestionAbort = null;
+    suggestionsPending = false;
   }
 
   function abortValidation() {
@@ -50,12 +50,14 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
     suggestions = [];
     suggestionNote = null;
     suggestionIndex = -1;
+    value = manualValue;
   }
 
   async function loadSuggestions(query: string) {
     abortSuggestions();
     const controller = new AbortController();
     suggestionAbort = controller;
+    suggestionsPending = true;
     try {
       const data = await options.fetchSuggestions(query, controller.signal);
       suggestions = data.items
@@ -82,6 +84,11 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
       if (!isAbortError(error)) {
         suggestionNote = 'Failed to load suggestions.';
       }
+    } finally {
+      if (suggestionAbort === controller) {
+        suggestionAbort = null;
+      }
+      suggestionsPending = false;
     }
   }
 
@@ -113,12 +120,16 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
 
   function handleInput(event: Event) {
     const newValue = (event.currentTarget as HTMLInputElement).value;
+    const trimmedValue = newValue.trim();
     value = newValue;
+    manualValue = newValue;
     resetSuggestions();
     abortSuggestions();
     abortValidation();
 
-    if (newValue.length < minLength) {
+    if (trimmedValue.length === 0) {
+      validationState = 'idle';
+    } else if (trimmedValue.length < minLength) {
       validationState = 'idle';
       return;
     }
@@ -130,11 +141,15 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
       void loadSuggestions(newValue);
     }, debounceTime);
 
+    if (trimmedValue.length === 0) {
+      return;
+    }
+
     if (validationDebounce) {
       clearTimeout(validationDebounce);
     }
     validationDebounce = setTimeout(() => {
-      void validate(newValue);
+      void validate(trimmedValue);
     }, debounceTime + 50); // Slightly longer debounce for validation
   }
 
@@ -151,6 +166,7 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
       event.preventDefault();
       const next = suggestionIndex + 1;
       suggestionIndex = next >= suggestions.length ? 0 : next;
+      value = suggestions[suggestionIndex] ?? value;
       scrollSuggestionIntoView(suggestionIndex);
       return;
     }
@@ -158,6 +174,7 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
       event.preventDefault();
       const next = suggestionIndex - 1;
       suggestionIndex = next < 0 ? suggestions.length - 1 : next;
+      value = suggestions[suggestionIndex] ?? value;
       scrollSuggestionIntoView(suggestionIndex);
       return;
     }
@@ -195,6 +212,7 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
 
   function applySuggestion(selected: string) {
     value = selected;
+    manualValue = selected;
     resetSuggestions();
     validationState = 'valid';
     abortValidation();
@@ -203,7 +221,8 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
 
   function handleFocus() {
     const trimmedValue = value.trim();
-    if (trimmedValue.length >= minLength && validationState !== 'valid') {
+    const hasValue = trimmedValue.length > 0;
+    if (hasValue && trimmedValue.length >= minLength && validationState !== 'valid') {
       abortValidation();
       validationState = 'pending';
       void validate(trimmedValue);
@@ -228,6 +247,7 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
     set fieldEl(node: HTMLDivElement | null) {
       fieldEl = node;
     },
+    get suggestionsPending() { return suggestionsPending; },
     setValidationState(state: 'idle' | 'pending' | 'valid' | 'invalid') {
       validationState = state;
     },

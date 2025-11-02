@@ -4,9 +4,56 @@
   import { tick, onMount, onDestroy } from "svelte";
   import { generateThumbnail } from "$lib/thumbnails";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
-  import { createAutocomplete, isAbortError } from "$lib/autocomplete/completion.svelte";
+  import {
+    createAutocomplete,
+    isAbortError,
+  } from "$lib/autocomplete/completion.svelte";
   import { fetchJSON } from "$lib/autocomplete";
   import { AutocompleteInput } from "$lib/components/autocomplete";
+  import type { PageData } from "./$types";
+
+  let { data }: { data: PageData } = $props();
+
+  const ownerMap = data.ownerMap ?? {};
+  const LOCAL_SUGGESTION_LIMIT = 20;
+
+  function resolveOwnerKey(candidate: string): string | null {
+    const target = candidate.trim().toLowerCase();
+    if (!target) {
+      return null;
+    }
+    for (const key of Object.keys(ownerMap)) {
+      if (key.toLowerCase() === target) {
+        return key;
+      }
+    }
+    return null;
+  }
+
+  function localOwnerSuggestions(query: string): string[] {
+    const owners = Object.keys(ownerMap);
+    if (owners.length === 0) {
+      return [];
+    }
+    const needle = query.trim().toLowerCase();
+    const matches = needle
+      ? owners.filter((owner) => owner.toLowerCase().startsWith(needle))
+      : owners;
+    return matches.slice(0, LOCAL_SUGGESTION_LIMIT);
+  }
+
+  function localRepoSuggestions(ownerValue: string, query: string): string[] {
+    const ownerKey = resolveOwnerKey(ownerValue);
+    if (!ownerKey) {
+      return [];
+    }
+    const repos = ownerMap[ownerKey] ?? [];
+    const needle = query.trim().toLowerCase();
+    const matches = needle
+      ? repos.filter((repo) => repo.toLowerCase().startsWith(needle))
+      : repos;
+    return matches.slice(0, LOCAL_SUGGESTION_LIMIT);
+  }
 
   let owner = $state("");
   let repo = $state("");
@@ -15,38 +62,87 @@
 
   const ownerAutocomplete = createAutocomplete(() => owner, {
     fetchSuggestions: async (query, signal) => {
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ login: string }>;
-      }>(
-        `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
-        signal
-      );
-      return {
-        items: data.items.map((item) => item.login),
-        total_count: data.total_count
-      };
+      const trimmed = query.trim();
+      const localItems = localOwnerSuggestions(trimmed).map((login) => ({
+        login,
+      }));
+      if (trimmed.length < 3) {
+        return {
+          items: localItems,
+          total_count: localItems.length,
+        };
+      }
+      try {
+        const data = await fetchJSON<{
+          total_count: number;
+          items: Array<{ login: string }>;
+        }>(
+          `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
+          signal,
+        );
+        const seen = new Set(
+          localItems.map((item) => item.login.toLowerCase()),
+        );
+        const remoteItems = data.items
+          .filter((item) =>
+            item.login.toLowerCase().startsWith(trimmed.toLowerCase()),
+          )
+          .filter((item) => !seen.has(item.login.toLowerCase()));
+        return {
+          items: [...localItems, ...remoteItems],
+          total_count: localItems.length + remoteItems.length,
+        };
+      } catch (error) {
+        if (!isAbortError(error)) {
+          console.error("Owner suggestion lookup failed", error);
+        }
+        return {
+          items: localItems,
+          total_count: localItems.length,
+        };
+      }
     },
     fetchValidation: async (query, signal) => {
+      if (resolveOwnerKey(query)) {
+        return true;
+      }
+      if (!query.trim()) {
+        return false;
+      }
       const response = await fetch(`https://api.github.com/users/${query}`, {
         signal,
         headers: import.meta.env.VITE_GITHUB_TOKEN
           ? {
               Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
+              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`,
             }
-          : { Accept: "application/vnd.github+json" }
+          : { Accept: "application/vnd.github+json" },
       });
       return response.ok;
     },
     onSelect: (value) => {
-      owner = value;
+      const canonical = resolveOwnerKey(value) ?? value;
+      owner = canonical;
       repo = "";
       repoAutocomplete.resetSuggestions();
       repoAutocomplete.abortValidation();
       repoAutocomplete.setValidationState("idle");
       repoAutocomplete.inputEl?.focus();
     },
+    minLength: 0,
+  });
+
+  let ownerExactMatch = $state(false);
+  $effect(() => {
+    const value = ownerAutocomplete.value.trim();
+    if (!value) {
+      ownerExactMatch = false;
+      return;
+    }
+    const canonical = resolveOwnerKey(value);
+    ownerExactMatch = canonical
+      ? canonical.toLowerCase() === value.toLowerCase()
+      : false;
   });
 
   const repoAutocomplete = createAutocomplete(() => repo, {
@@ -55,30 +151,69 @@
       if (!ownerLogin) {
         return { items: [], total_count: 0 };
       }
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ name: string; full_name: string }>;
-      }>(
-        `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${ownerLogin} ${query} in:name`)}&per_page=20`,
-        signal
+      const localRepos = localRepoSuggestions(ownerLogin, query).map(
+        (name) => ({
+          name,
+          full_name: `${resolveOwnerKey(ownerLogin) ?? ownerLogin}/${name}`,
+        }),
       );
-      data.items = data.items.filter((item: { full_name: string; }) => item.full_name.startsWith(`${ownerLogin}/`));
-      return data;
+      const trimmed = query.trim();
+      if (trimmed.length === 0) {
+        return {
+          items: localRepos,
+          total_count: localRepos.length,
+        };
+      }
+      try {
+        const resolvedOwner = resolveOwnerKey(ownerLogin) ?? ownerLogin;
+        const data = await fetchJSON<{
+          total_count: number;
+          items: Array<{ name: string; full_name: string }>;
+        }>(
+          `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${resolvedOwner} ${query} in:name`)}&per_page=20`,
+          signal,
+        );
+        const filteredItems = data.items.filter(
+          (item) =>
+            item.full_name.startsWith(`${resolvedOwner}/`) &&
+            item.name.toLowerCase().startsWith(trimmed.toLowerCase()),
+        );
+        const seen = new Set(localRepos.map((item) => item.name.toLowerCase()));
+        const remoteItems = filteredItems.filter(
+          (item) => !seen.has(item.name.toLowerCase()),
+        );
+        return {
+          items: [...localRepos, ...remoteItems],
+          total_count: localRepos.length + remoteItems.length,
+        };
+      } catch (error) {
+        if (!isAbortError(error)) {
+          console.error("Repository suggestion lookup failed", error);
+        }
+        return {
+          items: localRepos,
+          total_count: localRepos.length,
+        };
+      }
     },
     fetchValidation: async (query, signal) => {
       const ownerLogin = owner.trim();
       if (!ownerLogin || !query.trim()) {
         return false;
       }
-      const response = await fetch(`https://api.github.com/repos/${ownerLogin}/${query}`, {
-        signal,
-        headers: import.meta.env.VITE_GITHUB_TOKEN
-          ? {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
-            }
-          : { Accept: "application/vnd.github+json" }
-      });
+      const resolvedOwner = resolveOwnerKey(ownerLogin) ?? ownerLogin;
+      const response = await fetch(
+        `https://api.github.com/repos/${resolvedOwner}/${query}`,
+        {
+          signal,
+          headers: import.meta.env.VITE_GITHUB_TOKEN
+            ? {
+                Accept: "application/vnd.github+json",
+                Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`,
+              }
+            : { Accept: "application/vnd.github+json" },
+        },
+      );
       return response.ok;
     },
     onSelect: (value) => {
@@ -87,7 +222,7 @@
       repoAutocomplete.setValidationState("pending");
       void repoAutocomplete.validate(value);
     },
-    minLength: 1,
+    minLength: 0,
   });
 
   // Bind owner and repo to the autocomplete values
@@ -143,14 +278,26 @@
   let excludeBots = $state(true);
   let chartStrip = $state<HTMLDivElement | null>(null);
   let pointerDragging = $state(false);
-  let pointerDrag: { id: number; startX: number; scrollLeft: number } | null = null;
-  let batchStatus = $state<{ slug: string; current: number; total: number } | null>(null);
+  let pointerDrag: { id: number; startX: number; scrollLeft: number } | null =
+    null;
+  let batchStatus = $state<{
+    slug: string;
+    current: number;
+    total: number;
+  } | null>(null);
   let descriptions = $state<Array<string | undefined>>([]);
 
   let chartCardElements = $state<Array<HTMLElement | null>>([]);
   let thumbnailUrls = $state<Array<string | null>>([]);
-  let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>([]);
-  let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number; availableBytes: number } | null>(null);
+  let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>(
+    [],
+  );
+  let storageInfo = $state<{
+    gitBytes: number;
+    usedBytes: number;
+    totalBytes: number;
+    availableBytes: number;
+  } | null>(null);
   let storageStatus = $state<"idle" | "loading" | "error" | "ready">("idle");
   let storageError = $state<string | null>(null);
 
@@ -230,7 +377,7 @@
           repo: trimmedRepo,
           limit: contributorLimit,
           excludeBots: false,
-          topStarred
+          topStarred,
         }),
         signal: controller.signal,
       });
@@ -261,7 +408,9 @@
       const appendEntry = (entry: ProgressEntry) => {
         const next = [...progressEntries, entry];
         progressEntries =
-          next.length > MAX_ENTRIES ? next.slice(next.length - MAX_ENTRIES) : next;
+          next.length > MAX_ENTRIES
+            ? next.slice(next.length - MAX_ENTRIES)
+            : next;
       };
 
       const appendStatus = (message: string) => {
@@ -273,7 +422,7 @@
         if (last && last.kind === "status" && last.message === trimmed) {
           progressEntries = [
             ...progressEntries.slice(0, -1),
-            { ...last, timestamp }
+            { ...last, timestamp },
           ];
           return;
         }
@@ -282,7 +431,7 @@
           id: `${timestamp}-${Math.random()}`,
           message: trimmed,
           timestamp,
-          kind: "status"
+          kind: "status",
         });
       };
 
@@ -301,7 +450,9 @@
         const label = `[${safeCommand}] ${trimmed}`;
         const existingId = gitEntryLookup.get(safeCommand);
         if (existingId) {
-          const existingEntry = progressEntries.find((entry) => entry.id === existingId);
+          const existingEntry = progressEntries.find(
+            (entry) => entry.id === existingId,
+          );
           if (!existingEntry) {
             gitEntryLookup.delete(safeCommand);
             const id = `${timestamp}-${Math.random()}`;
@@ -311,7 +462,7 @@
               message: label,
               timestamp,
               kind: "git",
-              command: safeCommand
+              command: safeCommand,
             });
             return;
           }
@@ -319,12 +470,17 @@
           const updatedEntry: ProgressEntry = {
             ...existingEntry,
             message: label,
-            timestamp
+            timestamp,
           };
 
-          const filtered = progressEntries.filter((entry) => entry.id !== existingId);
+          const filtered = progressEntries.filter(
+            (entry) => entry.id !== existingId,
+          );
           const next = [...filtered, updatedEntry];
-          progressEntries = next.length > MAX_ENTRIES ? next.slice(next.length - MAX_ENTRIES) : next;
+          progressEntries =
+            next.length > MAX_ENTRIES
+              ? next.slice(next.length - MAX_ENTRIES)
+              : next;
           return;
         }
 
@@ -335,7 +491,7 @@
           message: label,
           timestamp,
           kind: "git",
-          command: safeCommand
+          command: safeCommand,
         });
       };
 
@@ -343,22 +499,32 @@
         const trimmed = line.trim();
         if (!trimmed) return;
         try {
-      const event = JSON.parse(trimmed) as
-        | { type: "status"; message: string }
-        | { type: "git"; command: string; stream: "stdout" | "stderr"; text: string }
-        | {
-            type: "partial";
-            summary: SummaryPayload;
-            index?: number;
-            total?: number;
-            description?: string | null;
-          }
-        | {
-            type: "complete";
-            summaries?: Array<SummaryPayload & { description?: string | null }>;
-          }
-        | { type: "result"; summary: SummaryPayload & { description?: string | null } }
-        | { type: "error"; message?: string };
+          const event = JSON.parse(trimmed) as
+            | { type: "status"; message: string }
+            | {
+                type: "git";
+                command: string;
+                stream: "stdout" | "stderr";
+                text: string;
+              }
+            | {
+                type: "partial";
+                summary: SummaryPayload;
+                index?: number;
+                total?: number;
+                description?: string | null;
+              }
+            | {
+                type: "complete";
+                summaries?: Array<
+                  SummaryPayload & { description?: string | null }
+                >;
+              }
+            | {
+                type: "result";
+                summary: SummaryPayload & { description?: string | null };
+              }
+            | { type: "error"; message?: string };
 
           if (event.type === "status") {
             appendStatus(event.message);
@@ -378,7 +544,7 @@
               batchStatus = {
                 slug: incoming.slug,
                 current: targetIndex + 1,
-                total
+                total,
               };
               summaries = nextSummaries;
               descriptions = nextDescriptions;
@@ -393,7 +559,9 @@
             }
           } else if (event.type === "complete") {
             summaries = event.summaries ?? [];
-            descriptions = (event.summaries ?? []).map((entry) => entry.description ?? undefined);
+            descriptions = (event.summaries ?? []).map(
+              (entry) => entry.description ?? undefined,
+            );
             thumbnailUrls = new Array(summaries.length).fill(null);
             thumbnailStatus = new Array(summaries.length).fill("idle");
             receivedComplete = true;
@@ -413,7 +581,8 @@
             scrollToCard(0).catch(() => {});
           } else if (event.type === "error") {
             const message =
-              event.message ?? "Unable to gather statistics. Please retry later.";
+              event.message ??
+              "Unable to gather statistics. Please retry later.";
             errorMessage = message;
             summaries = [];
             descriptions = [];
@@ -423,7 +592,9 @@
             receivedError = true;
           }
         } catch (parseError) {
-          console.error("Failed to parse progress message", parseError, { line });
+          console.error("Failed to parse progress message", parseError, {
+            line,
+          });
         }
       };
 
@@ -532,14 +703,12 @@
     return period.label;
   }
 
-
-
   function formatTimestamp(value: number): string {
     const date = new Date(value);
     return new Intl.DateTimeFormat(undefined, {
       hour: "2-digit",
       minute: "2-digit",
-      second: "2-digit"
+      second: "2-digit",
     }).format(date);
   }
 
@@ -547,7 +716,10 @@
     highlightedContributor = name ? name.trim() : null;
   }
 
-  function filterBots(source: SummaryPayload, shouldExclude: boolean): SummaryPayload {
+  function filterBots(
+    source: SummaryPayload,
+    shouldExclude: boolean,
+  ): SummaryPayload {
     if (!shouldExclude) {
       return source;
     }
@@ -556,7 +728,9 @@
 
     const periods = source.periods.map((period) => ({
       ...period,
-      contributors: period.contributors.filter((contributor) => !isBot(contributor.author))
+      contributors: period.contributors.filter(
+        (contributor) => !isBot(contributor.author),
+      ),
     }));
 
     const series = source.series.filter((item) => !isBot(item.name));
@@ -566,12 +740,10 @@
 
   const ownerIsValid = $derived(ownerAutocomplete.validationState === "valid");
   const filteredSummaries = $derived(
-    summaries.map((entry) => filterBots(entry, excludeBots))
+    summaries.map((entry) => filterBots(entry, excludeBots)),
   );
 
-  const activeSummary = $derived(
-    filteredSummaries[selectedIndex] ?? null
-  );
+  const activeSummary = $derived(filteredSummaries[selectedIndex] ?? null);
 
   const activeDescription = $derived(descriptions[selectedIndex]);
 
@@ -640,7 +812,11 @@
     return { width, max, bounce };
   }
 
-  function animateScrollTo(targetLeft: number, duration = 380, onComplete?: () => void) {
+  function animateScrollTo(
+    targetLeft: number,
+    duration = 380,
+    onComplete?: () => void,
+  ) {
     if (!chartStrip) {
       return;
     }
@@ -682,7 +858,10 @@
     }
   }
 
-  async function scrollToCard(index: number, behavior: ScrollBehavior = "smooth") {
+  async function scrollToCard(
+    index: number,
+    behavior: ScrollBehavior = "smooth",
+  ) {
     if (!chartStrip) {
       return;
     }
@@ -733,7 +912,10 @@
 
     const nextIndex = Math.round(chartStrip.scrollLeft / width);
     if (Number.isFinite(nextIndex) && nextIndex !== selectedIndex) {
-      const clamped = Math.min(Math.max(nextIndex, 0), filteredSummaries.length - 1);
+      const clamped = Math.min(
+        Math.max(nextIndex, 0),
+        filteredSummaries.length - 1,
+      );
       if (clamped !== selectedIndex) {
         selectedIndex = clamped;
       }
@@ -763,7 +945,7 @@
         const rawIndex = chartStrip.scrollLeft / width;
         const targetIndex = Math.min(
           Math.max(Math.round(rawIndex), 0),
-          filteredSummaries.length - 1
+          filteredSummaries.length - 1,
         );
         if (targetIndex !== selectedIndex) {
           selectedIndex = targetIndex;
@@ -819,7 +1001,9 @@
     event.preventDefault();
     stopScrollAnimation();
     const touch = event.touches[0];
-    const prev = chartStrip.dataset.prevTouchX ? Number(chartStrip.dataset.prevTouchX) : touch.clientX;
+    const prev = chartStrip.dataset.prevTouchX
+      ? Number(chartStrip.dataset.prevTouchX)
+      : touch.clientX;
     const delta = prev - touch.clientX;
     chartStrip.dataset.prevTouchX = String(touch.clientX);
     const { max, bounce } = getScrollMetrics();
@@ -842,7 +1026,7 @@
     pointerDrag = {
       id: event.pointerId,
       startX: event.clientX,
-      scrollLeft: chartStrip.scrollLeft
+      scrollLeft: chartStrip.scrollLeft,
     };
     chartStrip.setPointerCapture?.(event.pointerId);
     pointerDragging = true;
@@ -913,12 +1097,6 @@
     endPointerDrag(event);
   }
 
-
-
-
-
-  
-
   function repositoryName(slug: string): string {
     const parts = slug.split("/");
     return parts.length > 1 ? parts[1] : slug;
@@ -940,7 +1118,10 @@
     }
   }
 
-  function resolvedProfileUrl(name: string, fallback?: string | null): string | undefined {
+  function resolvedProfileUrl(
+    name: string,
+    fallback?: string | null,
+  ): string | undefined {
     if (fallback) {
       return fallback;
     }
@@ -951,7 +1132,10 @@
     const lower = name.toLowerCase();
     for (const period of summary.periods) {
       for (const contributor of period.contributors) {
-        if (contributor.profileUrl && contributor.author.toLowerCase() === lower) {
+        if (
+          contributor.profileUrl &&
+          contributor.author.toLowerCase() === lower
+        ) {
           return contributor.profileUrl;
         }
       }
@@ -985,7 +1169,10 @@
       return "0B";
     }
     const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-    const exponent = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+    const exponent = Math.min(
+      units.length - 1,
+      Math.floor(Math.log(value) / Math.log(1024)),
+    );
     const scaled = value / 1024 ** exponent;
     const display = scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(1);
     return `${display}${units[exponent]}`;
@@ -1012,7 +1199,10 @@
       storageStatus = "ready";
     } catch (error) {
       storageStatus = "error";
-      storageError = error instanceof Error ? error.message : "Unable to load storage information.";
+      storageError =
+        error instanceof Error
+          ? error.message
+          : "Unable to load storage information.";
     }
   }
 
@@ -1041,14 +1231,19 @@
         updated[nextIndex] = node;
         chartCardElements = updated;
         currentIndex = nextIndex;
-      }
+      },
     };
   }
 
-
-
   onMount(() => {
+    const focusHandle = requestAnimationFrame(() => {
+      ownerAutocomplete.inputEl?.focus();
+      ownerAutocomplete.handleFocus();
+    });
     void loadStorageInfo();
+    return () => {
+      cancelAnimationFrame(focusHandle);
+    };
   });
 </script>
 
@@ -1062,7 +1257,19 @@
   </header>
 
   <section class="controls">
-    <form onsubmit={handleSubmit}>
+    <form
+      class="grid gap-5 sm:grid-cols-2 lg:grid-cols-3"
+      onsubmit={handleSubmit}
+    >
+      <div class="sm:col-span-2 lg:col-span-3">
+        {#if owner.trim().length >= 0 && owner.trim().length < 3}
+          <p class="text-sm font-medium text-slate-600">
+            cached results. type more than 2 chars to get the github completion
+          </p>
+        {:else}
+          <p class="text-sm text-slate-400">&nbsp;</p>
+        {/if}
+      </div>
       <AutocompleteInput
         id="owner"
         label="Owner"
@@ -1077,11 +1284,10 @@
         applySuggestion={ownerAutocomplete.applySuggestion}
         resetSuggestions={ownerAutocomplete.resetSuggestions}
         handleFocus={ownerAutocomplete.handleFocus}
-        validate={ownerAutocomplete.validate}
-        abortSuggestions={ownerAutocomplete.abortSuggestions}
-        abortValidation={ownerAutocomplete.abortValidation}
         bind:inputEl={ownerAutocomplete.inputEl}
         bind:fieldEl={ownerAutocomplete.fieldEl}
+        highlightMatch={ownerExactMatch}
+        suggestionsPending={ownerAutocomplete.suggestionsPending}
       />
       <AutocompleteInput
         id="repo"
@@ -1097,15 +1303,15 @@
         applySuggestion={repoAutocomplete.applySuggestion}
         resetSuggestions={repoAutocomplete.resetSuggestions}
         handleFocus={repoAutocomplete.handleFocus}
-        validate={repoAutocomplete.validate}
-        abortSuggestions={repoAutocomplete.abortSuggestions}
-        abortValidation={repoAutocomplete.abortValidation}
         bind:inputEl={repoAutocomplete.inputEl}
         bind:fieldEl={repoAutocomplete.fieldEl}
         submitOnEmptyEnter
+        suggestionsPending={repoAutocomplete.suggestionsPending}
       />
-      <div class="field">
-        <label for="limit">Top contributors per year</label>
+      <div class="flex flex-col gap-2">
+        <label class="font-semibold text-sm" for="limit"
+          >Top contributors per year</label
+        >
         <input
           id="limit"
           name="limit"
@@ -1115,39 +1321,52 @@
           max="50"
           step="1"
           required
+          class="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-base shadow-sm transition focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
         />
       </div>
-      <div class="field field--checkbox">
-        <label for="exclude-bots">
+      <div class="flex items-center">
+        <label
+          class="flex items-center gap-2 font-semibold text-sm"
+          for="exclude-bots"
+        >
           <input
             id="exclude-bots"
             name="exclude-bots"
             type="checkbox"
+            class="h-4 w-4 rounded border-slate-300 text-blue-500 focus:ring-blue-200"
             bind:checked={excludeBots}
             onchange={() => setHighlight(null)}
           />
           <span>Hide bot accounts</span>
-      </label>
-    </div>
-    <p class="storage-info">
-      {#if storageStatus === "ready" && storageInfo}
-        <span class="storage-info__line">
-          {formatBytes(storageInfo.gitBytes)} of {formatBytes(storageInfo.totalBytes)} used
-          <span class="storage-info__available">(available {formatBytes(storageInfo.availableBytes ?? Math.max(storageInfo.totalBytes - storageInfo.usedBytes, 0))})</span>
-        </span>
-      {:else if storageStatus === "loading"}
-        <span>Checking storage…</span>
-      {:else if storageStatus === "error" && storageError}
-        <span class="storage-info__error">{storageError}</span>
-      {:else}
-        <span>Storage info unavailable</span>
-      {/if}
-    </p>
-    {#if batchStatus}
-      <p class="batch-status" aria-live="polite">
-        Handling <code>{batchStatus.slug}</code> {batchStatus.current}/{batchStatus.total}
+        </label>
+      </div>
+      <p class="storage-info">
+        {#if storageStatus === "ready" && storageInfo}
+          <span class="storage-info__line">
+            {formatBytes(storageInfo.gitBytes)} of {formatBytes(
+              storageInfo.totalBytes,
+            )} used
+            <span class="storage-info__available"
+              >(available {formatBytes(
+                storageInfo.availableBytes ??
+                  Math.max(storageInfo.totalBytes - storageInfo.usedBytes, 0),
+              )})</span
+            >
+          </span>
+        {:else if storageStatus === "loading"}
+          <span>Checking storage…</span>
+        {:else if storageStatus === "error" && storageError}
+          <span class="storage-info__error">{storageError}</span>
+        {:else}
+          <span>Storage info unavailable</span>
+        {/if}
       </p>
-    {/if}
+      {#if batchStatus}
+        <p class="batch-status" aria-live="polite">
+          Handling <code>{batchStatus.slug}</code>
+          {batchStatus.current}/{batchStatus.total}
+        </p>
+      {/if}
     </form>
 
     <div class="examples">
@@ -1166,7 +1385,11 @@
     </div>
 
     {#if progressEntries.length > 0 && loading}
-      <div class="progress" in:fade={{ duration: 200 }} out:fade={{ duration: 200 }}>
+      <div
+        class="progress"
+        in:fade={{ duration: 200 }}
+        out:fade={{ duration: 200 }}
+      >
         <p>Progress updates</p>
         <ul>
           {#each progressEntries as entry, index}
@@ -1185,8 +1408,8 @@
   {/if}
 
   <section class="chart">
-  {#if filteredSummaries.length === 0}
-    <div class="chart-card single">
+    {#if filteredSummaries.length === 0}
+      <div class="chart-card single">
         <ContributionChart
           {loading}
           series={activeSummary?.series ?? []}
@@ -1224,10 +1447,14 @@
             use:chartRef={index}
           >
             <header class="chart-card__header">
-              <span class="chart-card__index">{index + 1}/{filteredSummaries.length}</span>
+              <span class="chart-card__index"
+                >{index + 1}/{filteredSummaries.length}</span
+              >
               <span class="chart-card__slug">{item.slug}</span>
               {#if descriptions[index]}
-                <span class="chart-card__description">{descriptions[index]}</span>
+                <span class="chart-card__description"
+                  >{descriptions[index]}</span
+                >
               {/if}
             </header>
             <ContributionChart
@@ -1235,7 +1462,9 @@
               series={item.series}
               periods={item.periods}
               interval={item.interval}
-              highlighted={index === selectedIndex ? highlightedContributor : null}
+              highlighted={index === selectedIndex
+                ? highlightedContributor
+                : null}
               on:highlight={(event: CustomEvent<string | null>) => {
                 if (index === selectedIndex) {
                   setHighlight(event.detail ?? null);
@@ -1248,7 +1477,9 @@
     {/if}
   </section>
   {#if filteredSummaries.length > 1}
-    <p class="chart-hint">Swipe horizontally or use trackpad scroll to pan between charts.</p>
+    <p class="chart-hint">
+      Swipe horizontally or use trackpad scroll to pan between charts.
+    </p>
   {/if}
 
   {#if filteredSummaries.length > 0}
@@ -1271,7 +1502,10 @@
         >
           <span class="thumbnail__label">{repositoryName(summary.slug)}</span>
           {#if thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
-            <img src={thumbnailUrls[index] ?? ""} alt={`Preview of ${summary.slug}`} />
+            <img
+              src={thumbnailUrls[index] ?? ""}
+              alt={`Preview of ${summary.slug}`}
+            />
           {:else if thumbnailStatus[index] === "pending"}
             <span class="thumbnail__placeholder">Rendering…</span>
           {:else}
@@ -1303,10 +1537,16 @@
       </p>
       {#if activeSummary.periods.length > 0 && activeSummary.periods[0].contributors.length > 0}
         <div class="avatar-grid">
-          {#each (new Map(activeSummary.series.map((entry) => [entry.name.toLowerCase(), entry])).values()) as seriesEntry}
+          {#each new Map(activeSummary.series.map( (entry) => [entry.name.toLowerCase(), entry], )).values() as seriesEntry}
             <div class="avatar-card">
               <a
-                href={contributorLink(seriesEntry.name, resolvedProfileUrl(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl) ?? undefined)}
+                href={contributorLink(
+                  seriesEntry.name,
+                  resolvedProfileUrl(
+                    seriesEntry.name,
+                    (seriesEntry as { profileUrl?: string }).profileUrl,
+                  ) ?? undefined,
+                )}
                 target="_blank"
                 rel="noreferrer noopener"
                 onmouseenter={() => setHighlight(seriesEntry.name)}
@@ -1317,12 +1557,17 @@
                 {#if avatarSource(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl)}
                   <img
                     class="avatar"
-                    src={avatarSource(seriesEntry.name, (seriesEntry as { profileUrl?: string }).profileUrl) ?? ""}
+                    src={avatarSource(
+                      seriesEntry.name,
+                      (seriesEntry as { profileUrl?: string }).profileUrl,
+                    ) ?? ""}
                     alt={`Avatar of ${seriesEntry.name}`}
                     referrerpolicy="no-referrer"
                   />
                 {:else}
-                  <span class="avatar avatar--fallback" aria-hidden="true">{seriesEntry.name.at(0)}</span>
+                  <span class="avatar avatar--fallback" aria-hidden="true"
+                    >{seriesEntry.name.at(0)}</span
+                  >
                 {/if}
                 <span class="avatar-name">{seriesEntry.name}</span>
               </a>
@@ -1349,10 +1594,9 @@
                     <ul>
                       {#each period.contributors as contributor}
                         <li
-                          class:active={
-                            highlightedContributor &&
-                            highlightedContributor.toLowerCase() === contributor.author.toLowerCase()
-                          }
+                          class:active={highlightedContributor &&
+                            highlightedContributor.toLowerCase() ===
+                              contributor.author.toLowerCase()}
                           onmouseenter={() => setHighlight(contributor.author)}
                           onmouseleave={() => setHighlight(null)}
                         >
@@ -1424,54 +1668,6 @@
     gap: 1.5rem;
   }
 
-  form {
-    display: grid;
-    gap: 1.25rem;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    align-items: end;
-  }
-
-  .field {
-    display: grid;
-    gap: 0.5rem;
-  }
-
-  label {
-    font-weight: 600;
-    font-size: 0.9rem;
-  }
-
-  input {
-    padding: 0.7rem 0.9rem;
-    border-radius: 0.75rem;
-    border: 1px solid rgba(0, 0, 0, 0.15);
-    font-size: 1rem;
-    transition:
-      border-color 0.2s ease,
-      box-shadow 0.2s ease;
-  }
-
-  input::placeholder {
-    color: rgba(15, 23, 42, 0.45);
-  }
-
-  .field--checkbox {
-    align-self: center;
-  }
-
-  .field--checkbox label {
-    font-weight: 600;
-    font-size: 0.9rem;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .field--checkbox input[type="checkbox"] {
-    width: 1.1rem;
-    height: 1.1rem;
-  }
-
   .storage-info {
     margin-top: 0.25rem;
     font-size: 0.85rem;
@@ -1491,12 +1687,6 @@
   .storage-info__available {
     color: #2563eb;
     font-weight: 600;
-  }
-
-  input:focus {
-    outline: none;
-    border-color: #2563eb;
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
   }
 
   .examples {
@@ -1572,10 +1762,6 @@
     opacity: 0.55;
   }
 
-
-
-
-
   .batch-status {
     margin: 0;
     font-size: 0.9rem;
@@ -1641,7 +1827,10 @@
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: transform 0.15s ease, box-shadow 0.15s ease, border 0.15s ease;
+    transition:
+      transform 0.15s ease,
+      box-shadow 0.15s ease,
+      border 0.15s ease;
     border: 2px solid transparent;
   }
 
@@ -1811,7 +2000,9 @@
 
   td li {
     border-radius: 6px;
-    transition: background 0.2s ease, color 0.2s ease;
+    transition:
+      background 0.2s ease,
+      color 0.2s ease;
   }
 
   td li.active {
@@ -1827,13 +2018,13 @@
     color: #888;
   }
 
-	@media (max-width: 720px) {
-		.chart,
-		.summary,
-		.controls {
-			padding: 1.1rem;
-			border-radius: 12px;
-		}
+  @media (max-width: 720px) {
+    .chart,
+    .summary,
+    .controls {
+      padding: 1.1rem;
+      border-radius: 12px;
+    }
   }
 
   .avatar-grid {

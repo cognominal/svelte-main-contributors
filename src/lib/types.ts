@@ -28,3 +28,5 @@ export interface RepoContributionSummary {
 	}>;
 	series: ContributorSeries[];
 }
+
+export type OwnerMap = Record<string, string[]>;
