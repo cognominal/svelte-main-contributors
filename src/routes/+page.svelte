@@ -4,6 +4,105 @@
   import { tick, onMount, onDestroy } from "svelte";
   import { generateThumbnail } from "$lib/thumbnails";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
+  import { createAutocomplete, isAbortError } from "$lib/autocomplete/completion.svelte";
+  import { fetchJSON } from "$lib/autocomplete";
+  import { AutocompleteInput } from "$lib/components/autocomplete";
+
+  let owner = $state("");
+  let repo = $state("");
+
+  const GITHUB_BASE_URL = "https://github.com";
+
+  const ownerAutocomplete = createAutocomplete(() => owner, {
+    fetchSuggestions: async (query, signal) => {
+      const data = await fetchJSON<{
+        total_count: number;
+        items: Array<{ login: string }>;
+      }>(
+        `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
+        signal
+      );
+      return {
+        items: data.items.map((item) => item.login),
+        total_count: data.total_count
+      };
+    },
+    fetchValidation: async (query, signal) => {
+      const response = await fetch(`https://api.github.com/users/${query}`, {
+        signal,
+        headers: import.meta.env.VITE_GITHUB_TOKEN
+          ? {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
+            }
+          : { Accept: "application/vnd.github+json" }
+      });
+      return response.ok;
+    },
+    onSelect: (value) => {
+      owner = value;
+      repo = "";
+      repoAutocomplete.resetSuggestions();
+      repoAutocomplete.abortValidation();
+      repoAutocomplete.setValidationState("idle");
+      repoAutocomplete.inputEl?.focus();
+    },
+  });
+
+  const repoAutocomplete = createAutocomplete(() => repo, {
+    fetchSuggestions: async (query, signal) => {
+      const ownerLogin = owner.trim();
+      if (!ownerLogin) {
+        return { items: [], total_count: 0 };
+      }
+      const data = await fetchJSON<{
+        total_count: number;
+        items: Array<{ name: string; full_name: string }>;
+      }>(
+        `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${ownerLogin} ${query} in:name`)}&per_page=20`,
+        signal
+      );
+      data.items = data.items.filter((item: { full_name: string; }) => item.full_name.startsWith(`${ownerLogin}/`));
+      return data;
+    },
+    fetchValidation: async (query, signal) => {
+      const ownerLogin = owner.trim();
+      if (!ownerLogin || !query.trim()) {
+        return false;
+      }
+      const response = await fetch(`https://api.github.com/repos/${ownerLogin}/${query}`, {
+        signal,
+        headers: import.meta.env.VITE_GITHUB_TOKEN
+          ? {
+              Accept: "application/vnd.github+json",
+              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
+            }
+          : { Accept: "application/vnd.github+json" }
+      });
+      return response.ok;
+    },
+    onSelect: (value) => {
+      repo = value;
+      repoAutocomplete.abortValidation();
+      repoAutocomplete.setValidationState("pending");
+      void repoAutocomplete.validate(value);
+    },
+    minLength: 1,
+  });
+
+  // Bind owner and repo to the autocomplete values
+  $effect(() => {
+    owner = ownerAutocomplete.value;
+  });
+  $effect(() => {
+    repo = repoAutocomplete.value;
+  });
+
+  // Expose input elements for parent to bind:this
+  let ownerInputEl = ownerAutocomplete.inputEl;
+  let repoInputEl = repoAutocomplete.inputEl;
+  let ownerFieldEl = ownerAutocomplete.fieldEl;
+  let repoFieldEl = repoAutocomplete.fieldEl;
 
   interface SummaryPayload {
     slug: string;
@@ -24,8 +123,6 @@
     }>;
   }
 
-  let owner = $state("");
-  let repo = $state("");
   let limit = $state(5);
   let loading = $state(false);
   let errorMessage = $state("");
@@ -49,33 +146,14 @@
   let pointerDrag: { id: number; startX: number; scrollLeft: number } | null = null;
   let batchStatus = $state<{ slug: string; current: number; total: number } | null>(null);
   let descriptions = $state<Array<string | undefined>>([]);
-  let ownerSuggestions = $state<string[]>([]);
-  let ownerSuggestionNote = $state<string | null>(null);
-  let ownerSuggestionIndex = $state(-1);
-  let ownerValidationState = $state<"idle" | "pending" | "valid" | "invalid">("idle");
-  let repoSuggestions = $state<string[]>([]);
-  let repoSuggestionNote = $state<string | null>(null);
-  let repoSuggestionIndex = $state(-1);
-  let ownerInputEl: HTMLInputElement | null = null;
-  let repoInputEl: HTMLInputElement | null = null;
-  let ownerFieldEl: HTMLDivElement | null = null;
-  let repoFieldEl: HTMLDivElement | null = null;
-  let repoValidationState = $state<"idle" | "pending" | "valid" | "invalid">("idle");
+
   let chartCardElements = $state<Array<HTMLElement | null>>([]);
   let thumbnailUrls = $state<Array<string | null>>([]);
   let thumbnailStatus = $state<Array<"idle" | "pending" | "ready" | "error">>([]);
   let storageInfo = $state<{ gitBytes: number; usedBytes: number; totalBytes: number; availableBytes: number } | null>(null);
   let storageStatus = $state<"idle" | "loading" | "error" | "ready">("idle");
   let storageError = $state<string | null>(null);
-  const GITHUB_BASE_URL = "https://github.com";
-  let ownerSuggestionAbort: AbortController | null = null;
-  let repoSuggestionAbort: AbortController | null = null;
-  let ownerValidationAbort: AbortController | null = null;
-  let repoValidationAbort: AbortController | null = null;
-  let ownerSuggestionDebounce: ReturnType<typeof setTimeout> | undefined;
-  let ownerValidationDebounce: ReturnType<typeof setTimeout> | undefined;
-  let repoSuggestionDebounce: ReturnType<typeof setTimeout> | undefined;
-  let repoValidationDebounce: ReturnType<typeof setTimeout> | undefined;
+
   let snapEnabled = $state(true);
   let snapRestoreId: ReturnType<typeof setTimeout> | null = null;
   let scrollAnimationFrame: number | null = null;
@@ -108,8 +186,8 @@
       return;
     }
 
-    if (ownerValidationState !== "valid") {
-      const ownerOk = await validateOwner(trimmedOwner);
+    if (ownerAutocomplete.validationState !== "valid") {
+      const ownerOk = await ownerAutocomplete.validate(trimmedOwner);
       if (!ownerOk) {
         errorMessage =
           "Please provide a valid owner, repository, and contributor count.";
@@ -117,22 +195,13 @@
       }
     }
 
-    if (!topStarred && repoValidationState !== "valid") {
-      const repoOk = await validateRepo(trimmedOwner, trimmedRepo);
+    if (!topStarred && repoAutocomplete.validationState !== "valid") {
+      const repoOk = await repoAutocomplete.validate(trimmedRepo);
       if (!repoOk) {
         errorMessage =
           "Please provide a valid owner, repository, and contributor count.";
         return;
       }
-    }
-
-    if (
-      !Number.isFinite(contributorLimit) ||
-      contributorLimit <= 0
-    ) {
-      errorMessage =
-        "Please provide a valid owner, repository, and contributor count.";
-      return;
     }
 
     activeController?.abort();
@@ -144,12 +213,8 @@
     progressEntries = [];
     gitEntryLookup.clear();
     highlightedContributor = null;
-    ownerSuggestions = [];
-    ownerSuggestionNote = null;
-    repoSuggestions = [];
-    repoSuggestionNote = null;
-    ownerSuggestionIndex = -1;
-    repoSuggestionIndex = -1;
+    ownerAutocomplete.resetSuggestions();
+    repoAutocomplete.resetSuggestions();
     summaries = [];
     selectedIndex = 0;
     batchStatus = null;
@@ -411,26 +476,16 @@
   function useExample(repoExample: { owner: string; repo: string }) {
     owner = repoExample.owner;
     repo = repoExample.repo;
-    ownerValidationState = "valid";
-    ownerValidationAbort?.abort();
-    if (ownerValidationDebounce) {
-      clearTimeout(ownerValidationDebounce);
-      ownerValidationDebounce = undefined;
-    }
-    repoValidationAbort?.abort();
-    if (repoValidationDebounce) {
-      clearTimeout(repoValidationDebounce);
-      repoValidationDebounce = undefined;
-    }
-    repoValidationState = "valid";
+    ownerAutocomplete.setValidationState("valid");
+    ownerAutocomplete.abortValidation();
+    repoAutocomplete.setValidationState("valid");
+    repoAutocomplete.abortValidation();
     batchStatus = null;
     progressEntries = [];
     gitEntryLookup.clear();
     descriptions = [];
-    ownerSuggestions = [];
-    ownerSuggestionNote = null;
-    repoSuggestions = [];
-    repoSuggestionNote = null;
+    ownerAutocomplete.resetSuggestions();
+    repoAutocomplete.resetSuggestions();
     void handleSubmit();
   }
 
@@ -477,13 +532,7 @@
     return period.label;
   }
 
-  function isAbortError(error: unknown): boolean {
-    return (
-      error instanceof DOMException
-        ? error.name === "AbortError"
-        : error instanceof Error && error.name === "AbortError"
-    );
-  }
+
 
   function formatTimestamp(value: number): string {
     const date = new Date(value);
@@ -515,7 +564,7 @@
     return { ...source, periods, series };
   }
 
-  const ownerIsValid = $derived(ownerValidationState === "valid");
+  const ownerIsValid = $derived(ownerAutocomplete.validationState === "valid");
   const filteredSummaries = $derived(
     summaries.map((entry) => filterBots(entry, excludeBots))
   );
@@ -664,6 +713,8 @@
   $effect(() => {
     selectedIndex;
     highlightedContributor = null;
+    ownerAutocomplete.resetSuggestions();
+    repoAutocomplete.resetSuggestions();
     scrollToCard(selectedIndex).catch(() => {});
   });
 
@@ -862,326 +913,11 @@
     endPointerDrag(event);
   }
 
-  function abortOwnerSuggestions() {
-    ownerSuggestionAbort?.abort();
-    ownerSuggestionAbort = null;
-  }
 
-  function abortRepoSuggestions() {
-    repoSuggestionAbort?.abort();
-    repoSuggestionAbort = null;
-  }
 
-  function resetOwnerSuggestions() {
-    ownerSuggestions = [];
-    ownerSuggestionNote = null;
-    ownerSuggestionIndex = -1;
-  }
 
-  function resetRepoSuggestions() {
-    repoSuggestions = [];
-    repoSuggestionNote = null;
-    repoSuggestionIndex = -1;
-  }
 
-  async function fetchJSON<T>(url: string, signal: AbortSignal): Promise<T> {
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json"
-    };
-    if (import.meta.env.VITE_GITHUB_TOKEN) {
-      headers.Authorization = `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`;
-    }
-
-    const response = await fetch(url, { headers, signal });
-    if (!response.ok) {
-      throw new Error(`GitHub request failed (${response.status})`);
-    }
-    return (await response.json()) as T;
-  }
-
-  function handleOwnerInput(event: Event) {
-    const value = (event.currentTarget as HTMLInputElement).value.trim();
-    owner = value;
-    resetOwnerSuggestions();
-    abortOwnerSuggestions();
-    abortRepoSuggestions();
-    resetRepoSuggestions();
-    repoValidationAbort?.abort();
-    if (repoValidationDebounce) {
-      clearTimeout(repoValidationDebounce);
-      repoValidationDebounce = undefined;
-    }
-    repoValidationState = "idle";
-    repoSuggestionIndex = -1;
-    ownerValidationState = value.length >= 3 ? "pending" : "idle";
-    ownerValidationAbort?.abort();
-    if (ownerSuggestionDebounce) {
-      clearTimeout(ownerSuggestionDebounce);
-    }
-    if (ownerValidationDebounce) {
-      clearTimeout(ownerValidationDebounce);
-    }
-    if (value.length < 3) {
-      ownerValidationState = "idle";
-      return;
-    }
-    ownerSuggestionDebounce = setTimeout(() => {
-      void loadOwnerSuggestions(value);
-    }, 200);
-    ownerValidationDebounce = setTimeout(() => {
-      void validateOwner(value);
-    }, 200);
-  }
-
-  async function loadOwnerSuggestions(query: string) {
-    abortOwnerSuggestions();
-    const controller = new AbortController();
-    ownerSuggestionAbort = controller;
-    try {
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ login: string }>;
-      }>(
-        `https://api.github.com/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`,
-        controller.signal
-      );
-      ownerSuggestions = data.items.map((item) => item.login);
-      ownerSuggestionIndex = -1;
-      ownerSuggestionNote = data.total_count > 20 ? "Type more characters to refine results." : null;
-    } catch (error) {
-      if ((error as Error).name !== "AbortError") {
-        ownerSuggestionNote = "Failed to load owner suggestions.";
-      }
-    }
-  }
-
-  function scrollSuggestionIntoView(kind: "owner" | "repo", index: number) {
-    if (index < 0 || typeof document === "undefined") {
-      return;
-    }
-    const id = kind === "owner" ? `owner-suggestion-${index}` : `repo-suggestion-${index}`;
-    document.getElementById(id)?.scrollIntoView({ block: "nearest" });
-  }
-
-  async function handleOwnerKeyDown(event: KeyboardEvent) {
-    if (event.key === "ArrowDown" && ownerSuggestions.length > 0) {
-      event.preventDefault();
-      const next = ownerSuggestionIndex + 1;
-      ownerSuggestionIndex =
-        next >= ownerSuggestions.length ? 0 : next;
-      scrollSuggestionIntoView("owner", ownerSuggestionIndex);
-      return;
-    }
-    if (event.key === "ArrowUp" && ownerSuggestions.length > 0) {
-      event.preventDefault();
-      const next = ownerSuggestionIndex - 1;
-      ownerSuggestionIndex =
-        next < 0 ? ownerSuggestions.length - 1 : next;
-      scrollSuggestionIntoView("owner", ownerSuggestionIndex);
-      return;
-    }
-    if (event.key === "Escape") {
-      if (ownerSuggestions.length > 0 || ownerSuggestionNote) {
-        event.preventDefault();
-        resetOwnerSuggestions();
-      }
-      return;
-    }
-    if (event.key === "Tab" && ownerSuggestions.length > 0) {
-      event.preventDefault();
-      const targetIndex = ownerSuggestionIndex >= 0 ? ownerSuggestionIndex : 0;
-      applyOwnerSuggestion(ownerSuggestions[targetIndex]);
-      repoInputEl?.focus();
-    } else if (event.key === "Enter") {
-      const value = owner.trim();
-      if (ownerSuggestions.length > 0 && ownerSuggestionIndex >= 0) {
-        event.preventDefault();
-        applyOwnerSuggestion(ownerSuggestions[ownerSuggestionIndex]);
-        return;
-      }
-      if (value.length >= 3) {
-        event.preventDefault();
-        if (ownerValidationState !== "valid") {
-          const result = await validateOwner(value);
-          if (!result) {
-            return;
-          }
-        }
-        repo = "";
-        resetRepoSuggestions();
-        repoValidationAbort?.abort();
-        if (repoValidationDebounce) {
-          clearTimeout(repoValidationDebounce);
-          repoValidationDebounce = undefined;
-        }
-        repoValidationState = "idle";
-        progressEntries = [];
-        gitEntryLookup.clear();
-        summaries = [];
-        descriptions = [];
-        selectedIndex = 0;
-        highlightedContributor = null;
-        batchStatus = null;
-        void handleSubmit();
-      }
-    }
-  }
-
-  function applyOwnerSuggestion(login: string) {
-    owner = login;
-    resetOwnerSuggestions();
-    ownerValidationState = "valid";
-    ownerValidationAbort?.abort();
-    if (ownerValidationDebounce) {
-      clearTimeout(ownerValidationDebounce);
-      ownerValidationDebounce = undefined;
-    }
-    repoValidationAbort?.abort();
-    if (repoValidationDebounce) {
-      clearTimeout(repoValidationDebounce);
-      repoValidationDebounce = undefined;
-    }
-    repoValidationState = "idle";
-    repo = "";
-    resetRepoSuggestions();
-    repoInputEl?.focus();
-  }
-
-  function handleRepoInput(event: Event) {
-    if (!ownerIsValid) {
-      return;
-    }
-    const value = (event.currentTarget as HTMLInputElement).value.trim();
-    const ownerLogin = owner.trim();
-    repo = value;
-    resetRepoSuggestions();
-    abortRepoSuggestions();
-    repoSuggestionIndex = -1;
-    repoValidationAbort?.abort();
-    if (repoValidationDebounce) {
-      clearTimeout(repoValidationDebounce);
-      repoValidationDebounce = undefined;
-    }
-    if (repoSuggestionDebounce) {
-      clearTimeout(repoSuggestionDebounce);
-      repoSuggestionDebounce = undefined;
-    }
-    if (!value) {
-      repoValidationState = "idle";
-      return;
-    }
-    repoValidationState = "pending";
-    if (ownerLogin.length === 0) {
-      return;
-    }
-    if (value.length >= 3) {
-      repoSuggestionDebounce = setTimeout(() => {
-        void loadRepoSuggestions(ownerLogin, value);
-      }, 200);
-    }
-    repoValidationDebounce = setTimeout(() => {
-      void validateRepo(ownerLogin, value);
-    }, 250);
-  }
-
-  function handleRepoFocus() {
-    if (!ownerIsValid) {
-      return;
-    }
-    const ownerLogin = owner.trim();
-    const value = repo.trim();
-    if (!ownerLogin) {
-      return;
-    }
-    if (value.length >= 3) {
-      abortRepoSuggestions();
-      void loadRepoSuggestions(ownerLogin, value);
-    }
-    if (value && repoValidationState !== "valid") {
-      repoValidationAbort?.abort();
-      if (repoValidationDebounce) {
-        clearTimeout(repoValidationDebounce);
-        repoValidationDebounce = undefined;
-      }
-      repoValidationState = "pending";
-      void validateRepo(ownerLogin, value);
-    }
-  }
-
-  async function loadRepoSuggestions(ownerLogin: string, prefix: string) {
-    abortRepoSuggestions();
-    const controller = new AbortController();
-    repoSuggestionAbort = controller;
-    try {
-      const data = await fetchJSON<{
-        total_count: number;
-        items: Array<{ name: string; full_name: string }>;
-      }>(
-        `https://api.github.com/search/repositories?q=${encodeURIComponent(`user:${ownerLogin} ${prefix} in:name`)}&per_page=20`,
-        controller.signal
-      );
-      repoSuggestions = data.items
-        .filter((item) => item.full_name.startsWith(`${ownerLogin}/`))
-        .map((item) => item.name);
-      repoSuggestionIndex = -1;
-      repoSuggestionNote = data.total_count > 20 ? "Type more characters to refine results." : null;
-    } catch (error) {
-      if ((error as Error).name !== "AbortError") {
-        repoSuggestionNote = "Failed to load repository suggestions.";
-      }
-    }
-  }
-
-  function handleRepoKeyDown(event: KeyboardEvent) {
-    if (event.key === "ArrowDown" && repoSuggestions.length > 0) {
-      event.preventDefault();
-      const next = repoSuggestionIndex + 1;
-      repoSuggestionIndex =
-        next >= repoSuggestions.length ? 0 : next;
-      scrollSuggestionIntoView("repo", repoSuggestionIndex);
-      return;
-    }
-    if (event.key === "ArrowUp" && repoSuggestions.length > 0) {
-      event.preventDefault();
-      const next = repoSuggestionIndex - 1;
-      repoSuggestionIndex =
-        next < 0 ? repoSuggestions.length - 1 : next;
-      scrollSuggestionIntoView("repo", repoSuggestionIndex);
-      return;
-    }
-    if (event.key === "Escape") {
-      if (repoSuggestions.length > 0 || repoSuggestionNote) {
-        event.preventDefault();
-        resetRepoSuggestions();
-      }
-      return;
-    }
-    if (event.key === "Tab" && repoSuggestions.length > 0) {
-      event.preventDefault();
-      const targetIndex = repoSuggestionIndex >= 0 ? repoSuggestionIndex : 0;
-      applyRepoSuggestion(repoSuggestions[targetIndex]);
-      return;
-    }
-    if (event.key === "Enter" && repoSuggestions.length > 0 && repoSuggestionIndex >= 0) {
-      event.preventDefault();
-      applyRepoSuggestion(repoSuggestions[repoSuggestionIndex]);
-    }
-  }
-
-  function applyRepoSuggestion(name: string) {
-    repo = name;
-    resetRepoSuggestions();
-    repoValidationAbort?.abort();
-    if (repoValidationDebounce) {
-      clearTimeout(repoValidationDebounce);
-      repoValidationDebounce = undefined;
-    }
-    const ownerLogin = owner.trim();
-    if (ownerLogin) {
-      repoValidationState = "pending";
-      void validateRepo(ownerLogin, name);
-    }
-  }
+  
 
   function repositoryName(slug: string): string {
     const parts = slug.split("/");
@@ -1309,107 +1045,10 @@
     };
   }
 
-  async function validateOwner(login: string): Promise<boolean> {
-    if (!login.trim()) {
-      ownerValidationState = "idle";
-      return false;
-    }
-    ownerValidationAbort?.abort();
-    const controller = new AbortController();
-    ownerValidationAbort = controller;
-    ownerValidationState = "pending";
-    try {
-      const response = await fetch(`https://api.github.com/users/${login}`, {
-        signal: controller.signal,
-        headers: import.meta.env.VITE_GITHUB_TOKEN
-          ? {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
-            }
-          : { Accept: "application/vnd.github+json" }
-      });
-      if (!response.ok) {
-        ownerValidationState = "invalid";
-        return false;
-      }
-      ownerValidationState = "valid";
-      return true;
-    } catch (error) {
-      if ((error as Error).name === "AbortError") {
-        return false;
-      }
-      ownerValidationState = "invalid";
-      return false;
-    } finally {
-      if (ownerValidationAbort === controller) {
-        ownerValidationAbort = null;
-      }
-    }
-  }
 
-  async function validateRepo(ownerLogin: string, repoName: string): Promise<boolean> {
-    const login = ownerLogin.trim();
-    const repoValue = repoName.trim();
-    if (!login || !repoValue) {
-      repoValidationState = "idle";
-      return false;
-    }
-    repoValidationAbort?.abort();
-    const controller = new AbortController();
-    repoValidationAbort = controller;
-    repoValidationState = "pending";
-    try {
-      const response = await fetch(`https://api.github.com/repos/${login}/${repoValue}`, {
-        signal: controller.signal,
-        headers: import.meta.env.VITE_GITHUB_TOKEN
-          ? {
-              Accept: "application/vnd.github+json",
-              Authorization: `Bearer ${import.meta.env.VITE_GITHUB_TOKEN}`
-            }
-          : { Accept: "application/vnd.github+json" }
-      });
-      if (!response.ok) {
-        repoValidationState = "invalid";
-        return false;
-      }
-      repoValidationState = "valid";
-      return true;
-    } catch (error) {
-      if ((error as Error).name === "AbortError") {
-        return false;
-      }
-      repoValidationState = "invalid";
-      return false;
-    } finally {
-      if (repoValidationAbort === controller) {
-        repoValidationAbort = null;
-      }
-    }
-  }
 
   onMount(() => {
     void loadStorageInfo();
-    const handleGlobalPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (
-        (ownerSuggestions.length > 0 || ownerSuggestionNote) &&
-        ownerFieldEl &&
-        !ownerFieldEl.contains(target)
-      ) {
-        resetOwnerSuggestions();
-      }
-      if (
-        (repoSuggestions.length > 0 || repoSuggestionNote) &&
-        repoFieldEl &&
-        !repoFieldEl.contains(target)
-      ) {
-        resetRepoSuggestions();
-      }
-    };
-    window.addEventListener("pointerdown", handleGlobalPointerDown);
-    return () => {
-      window.removeEventListener("pointerdown", handleGlobalPointerDown);
-    };
   });
 </script>
 
@@ -1424,93 +1063,47 @@
 
   <section class="controls">
     <form onsubmit={handleSubmit}>
-      <div class="field field--with-suggestions" bind:this={ownerFieldEl}>
-        <label for="owner">Owner</label>
-        <div class="input-wrapper">
-          <input
-            id="owner"
-            name="owner"
-            bind:value={owner}
-            required
-            placeholder="torvalds"
-            bind:this={ownerInputEl}
-            oninput={handleOwnerInput}
-            onkeydown={handleOwnerKeyDown}
-            class:owner-valid={ownerIsValid}
-            aria-invalid={ownerValidationState === "invalid"}
-            aria-expanded={ownerSuggestions.length > 0 || ownerSuggestionNote ? "true" : "false"}
-            aria-controls={ownerSuggestions.length > 0 || ownerSuggestionNote ? "owner-suggestions" : undefined}
-            aria-activedescendant={
-              ownerSuggestionIndex >= 0 ? `owner-suggestion-${ownerSuggestionIndex}` : undefined
-            }
-          />
-          {#if ownerSuggestions.length > 0 || ownerSuggestionNote}
-            <ul class="suggestions" role="listbox" id="owner-suggestions">
-              {#each ownerSuggestions as suggestion, index}
-                <li>
-                  <button
-                    type="button"
-                    onclick={() => applyOwnerSuggestion(suggestion)}
-                    role="option"
-                    aria-selected={index === ownerSuggestionIndex}
-                    class:active={index === ownerSuggestionIndex}
-                    id={`owner-suggestion-${index}`}
-                  >
-                    {suggestion}
-                  </button>
-                </li>
-              {/each}
-              {#if ownerSuggestionNote}
-                <li class="suggestions__note">{ownerSuggestionNote}</li>
-              {/if}
-            </ul>
-          {/if}
-        </div>
-      </div>
-      <div class="field field--with-suggestions" bind:this={repoFieldEl}>
-        <label for="repo">Repository</label>
-        <div class="input-wrapper">
-          <input
-            id="repo"
-            name="repo"
-            bind:value={repo}
-            placeholder="linux"
-            disabled={!ownerIsValid}
-            bind:this={repoInputEl}
-            oninput={handleRepoInput}
-            onkeydown={handleRepoKeyDown}
-            onfocus={handleRepoFocus}
-            class:repo-valid={repoValidationState === "valid"}
-            aria-invalid={repoValidationState === "invalid"}
-            aria-expanded={repoSuggestions.length > 0 || repoSuggestionNote ? "true" : "false"}
-            aria-controls={repoSuggestions.length > 0 || repoSuggestionNote ? "repo-suggestions" : undefined}
-            aria-activedescendant={
-              repoSuggestionIndex >= 0 ? `repo-suggestion-${repoSuggestionIndex}` : undefined
-            }
-          />
-          {#if repoSuggestions.length > 0 || repoSuggestionNote}
-            <ul class="suggestions" role="listbox" id="repo-suggestions">
-              {#each repoSuggestions as suggestion, index}
-                <li>
-                  <button
-                    type="button"
-                    onclick={() => applyRepoSuggestion(suggestion)}
-                    role="option"
-                    aria-selected={index === repoSuggestionIndex}
-                    class:active={index === repoSuggestionIndex}
-                    id={`repo-suggestion-${index}`}
-                  >
-                    {suggestion}
-                  </button>
-                </li>
-              {/each}
-              {#if repoSuggestionNote}
-                <li class="suggestions__note">{repoSuggestionNote}</li>
-              {/if}
-            </ul>
-          {/if}
-        </div>
-      </div>
+      <AutocompleteInput
+        id="owner"
+        label="Owner"
+        placeholder="e.g. sveltejs"
+        disabled={loading}
+        value={ownerAutocomplete.value}
+        suggestions={ownerAutocomplete.suggestions}
+        suggestionNote={ownerAutocomplete.suggestionNote}
+        validationState={ownerAutocomplete.validationState}
+        handleInput={ownerAutocomplete.handleInput}
+        handleKeyDown={ownerAutocomplete.handleKeyDown}
+        applySuggestion={ownerAutocomplete.applySuggestion}
+        resetSuggestions={ownerAutocomplete.resetSuggestions}
+        handleFocus={ownerAutocomplete.handleFocus}
+        validate={ownerAutocomplete.validate}
+        abortSuggestions={ownerAutocomplete.abortSuggestions}
+        abortValidation={ownerAutocomplete.abortValidation}
+        bind:inputEl={ownerAutocomplete.inputEl}
+        bind:fieldEl={ownerAutocomplete.fieldEl}
+      />
+      <AutocompleteInput
+        id="repo"
+        label="Repository"
+        placeholder="e.g. svelte"
+        disabled={loading}
+        value={repoAutocomplete.value}
+        suggestions={repoAutocomplete.suggestions}
+        suggestionNote={repoAutocomplete.suggestionNote}
+        validationState={repoAutocomplete.validationState}
+        handleInput={repoAutocomplete.handleInput}
+        handleKeyDown={repoAutocomplete.handleKeyDown}
+        applySuggestion={repoAutocomplete.applySuggestion}
+        resetSuggestions={repoAutocomplete.resetSuggestions}
+        handleFocus={repoAutocomplete.handleFocus}
+        validate={repoAutocomplete.validate}
+        abortSuggestions={repoAutocomplete.abortSuggestions}
+        abortValidation={repoAutocomplete.abortValidation}
+        bind:inputEl={repoAutocomplete.inputEl}
+        bind:fieldEl={repoAutocomplete.fieldEl}
+        submitOnEmptyEnter
+      />
       <div class="field">
         <label for="limit">Top contributors per year</label>
         <input
@@ -1979,66 +1572,9 @@
     opacity: 0.55;
   }
 
-  .field--with-suggestions .input-wrapper {
-    position: relative;
-  }
 
-  .field--with-suggestions .input-wrapper input {
-    width: 100%;
-  }
 
-  .suggestions {
-    position: absolute;
-    top: calc(100% + 0.35rem);
-    left: 0;
-    right: 0;
-    list-style: none;
-    margin: 0;
-    padding: 0.35rem 0;
-    border: 1px solid rgba(15, 23, 42, 0.1);
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.98);
-    display: grid;
-    gap: 0.25rem;
-    box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
-    z-index: 10;
-    max-height: 14rem;
-    overflow-y: auto;
-  }
 
-  .suggestions li {
-    margin: 0;
-    padding: 0;
-  }
-
-  .suggestions button {
-    width: 100%;
-    text-align: left;
-    padding: 0.4rem 0.8rem;
-    background: transparent;
-    border: 0;
-    font-size: 0.9rem;
-    color: #1f2937;
-    cursor: pointer;
-  }
-
-  .suggestions button:hover,
-  .suggestions button:focus-visible,
-  .suggestions button.active {
-    background: rgba(37, 99, 235, 0.12);
-    outline: none;
-  }
-
-  .suggestions__note {
-    font-size: 0.8rem;
-    color: #4b5563;
-    padding: 0.3rem 0.8rem;
-  }
-
-  input.owner-valid,
-  input.repo-valid {
-    font-weight: 700;
-  }
 
   .batch-status {
     margin: 0;
