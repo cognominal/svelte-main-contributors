@@ -1,7 +1,7 @@
 <script lang="ts">
   import { line, curveMonotoneX } from "d3-shape";
   import { createEventDispatcher } from "svelte";
-  import { scaleLinear, scalePoint } from "d3-scale";
+  import { scaleLinear, scalePoint, scaleLog } from "d3-scale";
   import type { ContributorSeries } from "$lib/types";
 
   const PALETTE = [
@@ -33,6 +33,7 @@
     height = 540,
     loading = false,
     highlighted = null,
+    scale = "linear",
   } = $props<{
     series?: ContributorSeries[];
     periods?: Period[];
@@ -41,6 +42,7 @@
     height?: number;
     loading?: boolean;
     highlighted?: string | null;
+    scale?: "linear" | "log";
   }>();
 
   const margin = { top: 56, right: 240, bottom: 56, left: 80 };
@@ -98,12 +100,27 @@
       .padding(0.5),
   );
 
-  const yScale = $derived(
-    scaleLinear()
+  const yScale = $derived.by(() => {
+    if (scale === "log") {
+      const domainMin = maxCommits > 0 ? 1 : 0;
+      const logScale = scaleLog<number>()
+        .base(10)
+        .clamp(true)
+        .range([margin.top + chartHeight, margin.top]);
+
+      if (domainMin === 0) {
+        logScale.domain([1, Math.max(10, maxCommits)]);
+      } else {
+        logScale.domain([1, maxCommits]).nice();
+      }
+      return logScale;
+    }
+
+    return scaleLinear<number>()
       .domain([0, maxCommits])
       .nice()
-      .range([margin.top + chartHeight, margin.top]),
-  );
+      .range([margin.top + chartHeight, margin.top]);
+  });
 
   const lineGenerator = $derived(
     line<{ label: string; commits: number }>()
@@ -114,7 +131,14 @@
           Number.isFinite(xScale(d.label) ?? Number.NaN),
       )
       .x((d) => xScale(d.label) ?? margin.left)
-      .y((d) => yScale(d.commits)),
+      .y((d) => {
+        if (scale === "log") {
+          return d.commits > 0
+            ? yScale(d.commits)
+            : margin.top + chartHeight;
+        }
+        return yScale(d.commits);
+      }),
   );
 
   type ChartSeries = {
@@ -147,7 +171,12 @@
         points: values.map((value: { label: string; commits: number }) => ({
           ...value,
           x: xScale(value.label) ?? margin.left,
-          y: yScale(value.commits),
+          y:
+            scale === "log"
+              ? value.commits > 0
+                ? yScale(value.commits)
+                : margin.top + chartHeight
+              : yScale(value.commits),
         })),
       };
     }),
@@ -164,7 +193,24 @@
     );
   });
 
-  const yTicks = $derived(yScale.ticks(6));
+  const yTicks = $derived.by<number[]>(() => {
+    if (scale === "log") {
+      const domain = yScale.domain() as number[];
+      const [min, max] = domain;
+      if (!Number.isFinite(min) || !Number.isFinite(max) || max <= 0) {
+        return [0, 1];
+      }
+      const ticks: number[] = [0];
+      const startPower = Math.floor(Math.log10(Math.max(1, min)));
+      const endPower = Math.ceil(Math.log10(Math.max(1, max)));
+      for (let power = startPower; power <= endPower; power += 1) {
+        const value = 10 ** power;
+        ticks.push(value);
+      }
+      return ticks;
+    }
+    return (yScale as any).ticks(6) as number[];
+  });
 
   const normalisedHighlight = $derived(
     highlighted ? highlighted.trim().toLowerCase() : null,
@@ -236,7 +282,7 @@
 
     <g class="axis axis--y">
       {#each yTicks as commits}
-        {@const y = yScale(commits)}
+        {@const y = commits > 0 ? yScale(commits) : margin.top + chartHeight}
         <line x1={margin.left - 6} x2={margin.left} y1={y} y2={y} />
         <line
           x1={margin.left}
@@ -245,7 +291,13 @@
           y2={y}
           class="grid"
         />
-        <text x={margin.left - 12} y={y + 4} text-anchor="end">{commits}</text>
+        <text x={margin.left - 12} y={y + 4} text-anchor="end">
+          {#if scale === "log"}
+            {commits > 0 ? commits.toLocaleString() : "0"}
+          {:else}
+            {commits}
+          {/if}
+        </text>
       {/each}
       <line
         x1={margin.left}

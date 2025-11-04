@@ -4,6 +4,7 @@ import {
 	type ProgressEvent,
 	RepositoryNotClonedError
 } from '$lib/server/gitStats';
+import { collectRemoteContributionSummary } from '$lib/server/githubRemoteStats';
 import type { RepoContributionSummary } from '$lib/types';
 import type { RequestHandler } from './$types';
 
@@ -199,17 +200,67 @@ const collected: Array<{
 								});
 
 								try {
-									const summary = await collectContributionSummary(currentSlug, limit, {
-										onProgress: handleProgress,
-										signal,
-										cloneIfMissing: cloneMissing
-									});
+									let summary: RepoContributionSummary | null = null;
+									let cloned = false;
+									let remoteFailure: Error | null = null;
+
+									try {
+										summary = await collectRemoteContributionSummary(currentSlug, limit, {
+											onProgress: handleProgress,
+											signal
+										});
+									} catch (error) {
+										remoteFailure = error as Error;
+										handleProgress({
+											type: 'status',
+											message: `GitHub API stats unavailable for ${currentSlug}: ${remoteFailure.message}`
+										});
+									}
+
+									if (!summary && cloneMissing) {
+										const clonedSummary = await collectContributionSummary(currentSlug, limit, {
+											onProgress: handleProgress,
+											signal,
+											cloneIfMissing: cloneMissing
+										});
+										summary = clonedSummary;
+										cloned = true;
+									} else if (!summary && !cloneMissing) {
+										const message =
+											remoteFailure?.message ??
+											'Contributor statistics are not yet available from GitHub.';
+										handleProgress({
+											type: 'status',
+											message
+										});
+										collected[index] = {
+											slug: currentSlug,
+											summary: null,
+											description: repoSummaries[index]?.description ?? null,
+											cloned: false
+										};
+										send({
+											type: 'partial',
+											index,
+											total: slugs.length,
+											summary: null,
+											description: repoSummaries[index]?.description ?? null,
+											cloned: false,
+											slug: currentSlug
+										});
+										continue;
+									}
+
+									if (!summary) {
+										throw remoteFailure ?? new Error('Contributor statistics unavailable.');
+									}
+
 									const finalSummary = excludeBots ? filterBotContributors(summary) : summary;
 									collected[index] = {
 										slug: currentSlug,
 										summary: finalSummary,
 										description: repoSummaries[index]?.description ?? null,
-										cloned: true
+										cloned
 									};
 									send({
 										type: 'partial',
@@ -217,7 +268,7 @@ const collected: Array<{
 										total: slugs.length,
 										summary: serializeSummary(finalSummary),
 										description: repoSummaries[index]?.description ?? null,
-										cloned: true,
+										cloned,
 										slug: currentSlug
 									});
 								} catch (error) {

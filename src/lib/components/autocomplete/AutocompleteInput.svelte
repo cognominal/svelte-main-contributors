@@ -26,6 +26,7 @@
     submitOnEmptyEnter?: boolean;
     highlightMatch?: boolean;
     suggestionsPending?: boolean;
+    getSuggestionBadge?: (suggestion: string) => string | null | undefined;
   }
 
   let { 
@@ -52,9 +53,13 @@
     submitOnEmptyEnter = false,
     highlightMatch = false,
     suggestionsPending = false,
+    getSuggestionBadge,
   }: AutocompleteInputProps = $props();
 
   const isLoading = $derived(suggestionsPending || validationState === 'pending');
+  const suggestionBadges = $derived(
+    suggestions.map((suggestion) => getSuggestionBadge?.(suggestion) ?? null)
+  );
 
   $effect(() => { 
     if (suggestions && value) {
@@ -109,7 +114,7 @@
         applySuggestion(suggestions[suggestionIndex]);
         return;
       }
-      if (submitOnEmptyEnter && trimmedValue.length === 0 && suggestions.length === 0) {
+      if (submitOnEmptyEnter && trimmedValue.length === 0 && suggestionIndex < 0) {
         event.preventDefault();
         const form = fieldEl?.closest('form');
         form?.requestSubmit();
@@ -208,12 +213,20 @@
               aria-selected={index === suggestionIndex}
               class={cn(
                 'w-full rounded-lg px-3 py-2 text-left text-sm text-slate-800 focus:outline-none',
+                'flex items-center justify-between gap-3',
                 'hover:bg-blue-50 focus:bg-blue-50',
                 index === suggestionIndex && 'bg-blue-100'
               )}
               id={`${id}-suggestion-${index}`}
             >
-              {suggestion}
+              <span class={cn('truncate', highlightMatch && 'font-semibold')}>
+                {suggestion}
+              </span>
+              {#if suggestionBadges[index]}
+                <span class="text-xs uppercase tracking-wide text-slate-400">
+                  {suggestionBadges[index]}
+                </span>
+              {/if}
             </button>
           </li>
         {/each}

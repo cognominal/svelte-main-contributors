@@ -62,10 +62,106 @@
     return matches.slice(0, LOCAL_SUGGESTION_LIMIT);
   }
 
+  const OWNER_REPO_SEPARATOR = "/";
+
+  function normaliseSlug(ownerValue: string, repoName: string): string | null {
+    const trimmedOwner = ownerValue.trim();
+    const trimmedRepo = repoName.trim();
+    if (!trimmedOwner || !trimmedRepo) {
+      return null;
+    }
+    const ownerKey = resolveOwnerKey(trimmedOwner) ?? trimmedOwner;
+    return `${ownerKey}${OWNER_REPO_SEPARATOR}${trimmedRepo}`.toLowerCase();
+  }
+
+  let clonedSlugMap = $state<Record<string, true>>({});
+  let suggestionStatusSlug = $state<string | null>(null);
+  let suggestionStatusMessage = $state<string | null>(null);
+
+  function initialiseClonedSlugMap() {
+    const next: Record<string, true> = {};
+    for (const [ownerKey, repos] of Object.entries(ownerMap)) {
+      for (const repoName of repos) {
+        const key = normaliseSlug(ownerKey, repoName);
+        if (key) {
+          next[key] = true;
+        }
+      }
+    }
+    clonedSlugMap = next;
+  }
+
+  initialiseClonedSlugMap();
+
+  function markRepoCloned(slug: string | null | undefined) {
+    if (!slug) return;
+    const key = slug.toLowerCase();
+    if (!key || clonedSlugMap[key]) {
+      return;
+    }
+    clonedSlugMap = { ...clonedSlugMap, [key]: true };
+  }
+
+  function isRepoCloned(ownerValue: string, repoName: string): boolean {
+    const key = normaliseSlug(ownerValue, repoName);
+    if (key && clonedSlugMap[key]) {
+      return true;
+    }
+    return false;
+  }
+
+  function statusMessageForSlug(slug: string): string | null {
+    if (!slug) {
+      return null;
+    }
+    const entry = repoResults.find(
+      (item) => item?.slug?.toLowerCase() === slug.toLowerCase(),
+    );
+    if (entry?.summary) {
+      const summary = entry.summary;
+      const intervalName = intervalLabel(summary.interval);
+      const range = formatRange(summary);
+      const contributorCount = summary.series.length;
+      const topLimit = Number(limit) || 0;
+      const limitValue = topLimit > 0 ? topLimit : contributorCount;
+      return `Summary ready · Tracking commits from ${range}, highlighting the top ${limitValue} contributors per ${intervalName} (${contributorCount} contributors in summary).`;
+    }
+    if (entry?.cloned || clonedSlugMap[slug.toLowerCase()]) {
+      const descriptionPart = entry?.description
+        ? ` · ${entry.description}`
+        : "";
+      return `Cloned locally · Run the query to refresh contributor statistics${descriptionPart}.`;
+    }
+    const descriptionPart = entry?.description ? ` · ${entry.description}` : "";
+    return `Not analysed yet · Press Enter to fetch contributor statistics${descriptionPart}.`;
+  }
+
+  function updateSuggestionStatus() {
+    const ownerValue = owner.trim();
+    const index = repoAutocomplete.suggestionIndex;
+    const suggestions = repoAutocomplete.suggestions;
+    if (!ownerValue || index < 0 || index >= suggestions.length) {
+      suggestionStatusSlug = null;
+      suggestionStatusMessage = null;
+      return;
+    }
+    const suggestion = suggestions[index];
+    const ownerKey = resolveOwnerKey(ownerValue) ?? ownerValue;
+    const slug = `${ownerKey}/${suggestion}`.toLowerCase();
+    suggestionStatusSlug = slug;
+    suggestionStatusMessage = statusMessageForSlug(slug);
+  }
+
   let owner = $state("");
   let repo = $state("");
+  let lastOwnerSnapshot = "";
 
   const GITHUB_BASE_URL = "https://github.com";
+  let chartScale = $state<"linear" | "log">("linear");
+
+  $effect(() => {
+    chartScale;
+  });
 
   const ownerAutocomplete = createAutocomplete(() => owner, {
     fetchSuggestions: async (query, signal) => {
@@ -165,14 +261,38 @@
         }),
       );
       const trimmed = query.trim();
+      const resolvedOwner = resolveOwnerKey(ownerLogin) ?? ownerLogin;
       if (trimmed.length === 0) {
-        return {
-          items: localRepos,
-          total_count: localRepos.length,
-        };
+        try {
+          const data = await fetchJSON<
+            Array<{ name: string; full_name: string }>
+          >(
+            `https://api.github.com/users/${resolvedOwner}/repos?per_page=20&sort=updated&direction=desc`,
+            signal,
+          );
+          const seen = new Set(
+            localRepos.map((item) => item.name.toLowerCase()),
+          );
+          const remoteItems = data.filter(
+            (item) =>
+              item.full_name?.startsWith(`${resolvedOwner}/`) &&
+              !seen.has(item.name.toLowerCase()),
+          );
+          return {
+            items: [...localRepos, ...remoteItems],
+            total_count: localRepos.length + remoteItems.length,
+          };
+        } catch (error) {
+          if (!isAbortError(error)) {
+            console.error("Repository list lookup failed", error);
+          }
+          return {
+            items: localRepos,
+            total_count: localRepos.length,
+          };
+        }
       }
       try {
-        const resolvedOwner = resolveOwnerKey(ownerLogin) ?? ownerLogin;
         const data = await fetchJSON<{
           total_count: number;
           items: Array<{ name: string; full_name: string }>;
@@ -227,7 +347,13 @@
       repo = value;
       repoAutocomplete.abortValidation();
       repoAutocomplete.setValidationState("pending");
-      void repoAutocomplete.validate(value);
+      void (async () => {
+        const ok = await repoAutocomplete.validate(value);
+        if (ok) {
+          await tick();
+          await handleSubmit();
+        }
+      })();
     },
     minLength: 0,
   });
@@ -377,6 +503,8 @@
     highlightedContributor = null;
     ownerAutocomplete.resetSuggestions();
     repoAutocomplete.resetSuggestions();
+    suggestionStatusSlug = null;
+    suggestionStatusMessage = null;
     repoResults = [];
     selectedIndex = 0;
     batchStatus = null;
@@ -511,6 +639,15 @@
             thumbnailStatus = nextStatuses;
             selectedIndex = targetIndex;
             scrollToCard(targetIndex, "auto").catch(() => {});
+            if (event.cloned) {
+              markRepoCloned(event.slug);
+            }
+            if (event.slug) {
+              const slugKey = event.slug.toLowerCase();
+              if (slugKey === suggestionStatusSlug) {
+                suggestionStatusMessage = statusMessageForSlug(slugKey);
+              }
+            }
           } else if (event.type === "complete") {
             const entries = event.entries ?? [];
             repoResults = entries.map((entry) => ({
@@ -527,6 +664,17 @@
             batchStatus = null;
             if (repoResults.length > 0 && selectedIndex >= repoResults.length) {
               selectedIndex = repoResults.length - 1;
+            }
+            for (const entry of entries) {
+              if (entry?.cloned) {
+                markRepoCloned(entry.slug);
+              }
+              if (entry?.slug) {
+                const slugKey = entry.slug.toLowerCase();
+                if (slugKey === suggestionStatusSlug) {
+                  suggestionStatusMessage = statusMessageForSlug(slugKey);
+                }
+              }
             }
             console.log("[contrib] complete event", {
               entries: entries.length,
@@ -710,6 +858,31 @@
   const chartCount = $derived(
     filteredEntries.filter((entry) => entry.filteredSummary).length,
   );
+
+  $effect(() => {
+    repoAutocomplete.suggestionIndex;
+    repoAutocomplete.suggestions;
+    owner;
+    repoResults;
+    clonedSlugMap;
+    limit;
+    updateSuggestionStatus();
+  });
+
+  $effect(() => {
+    const trimmedOwner = owner.trim();
+    if (trimmedOwner !== lastOwnerSnapshot) {
+      lastOwnerSnapshot = trimmedOwner;
+      if (repo.trim().length > 0) {
+        repo = "";
+      }
+      repoAutocomplete.resetSuggestions();
+      repoAutocomplete.abortValidation();
+      repoAutocomplete.setValidationState("idle");
+      suggestionStatusSlug = null;
+      suggestionStatusMessage = null;
+    }
+  });
 
   $effect(() => {
     if (filteredEntries.length === 0) {
@@ -1319,7 +1492,8 @@
       <div class="sm:col-span-2 lg:col-span-3">
         {#if owner.trim().length > 0 && owner.trim().length < 3}
           <p class="text-sm font-medium text-slate-600">
-            cached results. type more than three chars to get the github completion
+            cached results. type more than three chars to get the github
+            completion
           </p>
         {:else}
           <p class="text-sm text-slate-400">&nbsp;</p>
@@ -1362,6 +1536,8 @@
         bind:fieldEl={repoAutocomplete.fieldEl}
         submitOnEmptyEnter
         suggestionsPending={repoAutocomplete.suggestionsPending}
+        getSuggestionBadge={(suggestion) =>
+          owner.trim() && isRepoCloned(owner, suggestion) ? "cloned" : null}
       />
       <div class="flex flex-col gap-2">
         <label class="font-semibold text-sm" for="limit"
@@ -1416,7 +1592,9 @@
           <span>Storage info unavailable</span>
         {/if}
       </p>
-      {#if batchStatus}
+      {#if suggestionStatusMessage}
+        <p class="batch-status" aria-live="polite">{suggestionStatusMessage}</p>
+      {:else if batchStatus}
         <p class="batch-status" aria-live="polite">
           Handling <code>{batchStatus.slug}</code>
           {batchStatus.current}/{batchStatus.total}
@@ -1443,7 +1621,7 @@
       <div in:fade={{ duration: 200 }} out:fade={{ duration: 200 }}>
         <ProgressPanel
           entries={progressEntries}
-          loading={loading}
+          {loading}
           formatter={formatTimestamp}
           class="border-none bg-transparent shadow-none"
         />
@@ -1464,6 +1642,7 @@
           periods={activeSummary?.periods ?? []}
           interval={activeSummary?.interval ?? "year"}
           highlighted={highlightedContributor}
+          scale={chartScale}
           on:highlight={(event: CustomEvent<string | null>) =>
             setHighlight(event.detail ?? null)}
         />
@@ -1500,9 +1679,7 @@
               >
               <span class="chart-card__slug">{item.slug}</span>
               {#if item.description}
-                <span class="chart-card__description"
-                  >{item.description}</span
-                >
+                <span class="chart-card__description">{item.description}</span>
               {/if}
             </header>
             {#if item.filteredSummary}
@@ -1511,6 +1688,7 @@
                 series={item.filteredSummary.series}
                 periods={item.filteredSummary.periods}
                 interval={item.filteredSummary.interval}
+                scale={chartScale}
                 highlighted={index === selectedIndex
                   ? highlightedContributor
                   : null}
@@ -1524,7 +1702,9 @@
                 Cloned locally
               </p>
             {:else}
-              <div class="mt-4 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600">
+              <div
+                class="mt-4 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600"
+              >
                 <p class="mb-3">
                   Clone this repository to generate contributor statistics.
                 </p>
@@ -1543,6 +1723,33 @@
       </div>
     {/if}
   </section>
+  <fieldset class="chart-controls">
+    <legend class="chart-controls__label">Y-axis scale</legend>
+    <label class="chart-controls__option">
+      <input
+        type="radio"
+        name="chart-scale"
+        value="linear"
+        checked={chartScale === "linear"}
+        onchange={() => {
+          chartScale = "linear";
+        }}
+      />
+      <span>Linear</span>
+    </label>
+    <label class="chart-controls__option">
+      <input
+        type="radio"
+        name="chart-scale"
+        value="log"
+        checked={chartScale === "log"}
+        onchange={() => {
+          chartScale = "log";
+        }}
+      />
+      <span>Logarithmic</span>
+    </label>
+  </fieldset>
   {#if chartCount > 1}
     <p class="chart-hint">
       Swipe horizontally or use trackpad scroll to pan between charts.
@@ -1971,6 +2178,84 @@
     font-size: 0.85rem;
     color: #4b5563;
     text-align: right;
+  }
+
+  .chart-controls {
+    margin: 1rem 0 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    font-size: 0.85rem;
+    color: #4b5563;
+    border: none;
+    padding: 0;
+  }
+
+  .chart-controls__label {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    font-size: 0.75rem;
+    color: #475569;
+    margin: 0;
+  }
+
+  .chart-controls__option {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.75rem;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    background: #ffffff;
+    cursor: pointer;
+    transition:
+      background 0.2s ease,
+      border-color 0.2s ease,
+      color 0.2s ease;
+  }
+
+  .chart-controls__option:hover {
+    border-color: rgba(37, 99, 235, 0.4);
+    color: #2563eb;
+  }
+
+  .chart-controls__option input[type="radio"] {
+    appearance: none;
+    width: 0.9rem;
+    height: 0.9rem;
+    border-radius: 999px;
+    border: 2px solid rgba(148, 163, 184, 0.6);
+    display: grid;
+    place-items: center;
+    transition:
+      border-color 0.2s ease,
+      background 0.2s ease;
+  }
+
+  .chart-controls__option input[type="radio"]::after {
+    content: "";
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 999px;
+    background: transparent;
+    transition: background 0.2s ease;
+  }
+
+  .chart-controls__option input[type="radio"]:checked {
+    border-color: #2563eb;
+    background: rgba(37, 99, 235, 0.1);
+  }
+
+  .chart-controls__option input[type="radio"]:checked::after {
+    background: #2563eb;
+  }
+
+  .chart-controls__option span {
+    font-weight: 600;
+    font-size: 0.8rem;
+    color: #1f2937;
   }
 
   .error {
