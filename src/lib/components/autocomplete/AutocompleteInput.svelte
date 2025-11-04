@@ -1,5 +1,6 @@
 <script lang="ts">
-import { cn } from '../../utils'; // Changed to relative path
+  import { onDestroy, onMount } from 'svelte';
+  import { cn } from '../../utils'; // Changed to relative path
 
   interface AutocompleteInputProps {
     value: string; // Keep value as a prop
@@ -58,6 +59,8 @@ import { cn } from '../../utils'; // Changed to relative path
   $effect(() => { 
     if (suggestions && value) {
       suggestionIndex = suggestions.indexOf(value);
+    } else {
+      suggestionIndex = -1;
     }
   });
 
@@ -123,6 +126,46 @@ import { cn } from '../../utils'; // Changed to relative path
   }
 
   let suggestionIndex = $state(-1);
+
+  function handleDocumentPointerDown(event: PointerEvent | MouseEvent) {
+    if (!fieldEl) {
+      return;
+    }
+    const target = event.target as Node | null;
+    if (target && fieldEl.contains(target)) {
+      return;
+    }
+    suggestionIndex = -1;
+    resetSuggestions();
+  }
+
+  function handleDocumentFocusIn(event: FocusEvent) {
+    if (!fieldEl) {
+      return;
+    }
+    const target = event.target as Node | null;
+    if (target && fieldEl.contains(target)) {
+      return;
+    }
+    suggestionIndex = -1;
+    resetSuggestions();
+  }
+
+  onMount(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    document.addEventListener('focusin', handleDocumentFocusIn, true);
+  });
+
+  onDestroy(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+    document.removeEventListener('focusin', handleDocumentFocusIn, true);
+  });
 </script>
 
 <div class={cn("flex flex-col gap-2", class_)} bind:this={fieldEl}>

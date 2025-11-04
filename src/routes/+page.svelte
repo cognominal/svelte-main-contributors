@@ -1,9 +1,16 @@
 <script lang="ts">
   import ContributionChart from "$lib/components/ContributionChart.svelte";
+  import ProgressPanel from "$lib/components/ui/progress-panel.svelte";
   import { fade } from "svelte/transition";
   import { tick, onMount, onDestroy } from "svelte";
   import { generateThumbnail } from "$lib/thumbnails";
   import type { AggregationInterval, ContributorSeries } from "$lib/types";
+  import {
+    appendProgressStatus,
+    upsertProgressGitEntry,
+    MAX_PROGRESS_ENTRIES,
+    type ProgressEntry,
+  } from "$lib/components/contribution-progress";
   import {
     createAutocomplete,
     isAbortError,
@@ -258,19 +265,18 @@
     }>;
   }
 
+  interface RepoResult {
+    slug: string;
+    cloned: boolean;
+    summary: SummaryPayload | null;
+    description?: string;
+  }
+
   let limit = $state(5);
   let loading = $state(false);
   let errorMessage = $state("");
-  let summaries = $state<SummaryPayload[]>([]);
+  let repoResults = $state<RepoResult[]>([]);
   let selectedIndex = $state(0);
-  interface ProgressEntry {
-    id: string;
-    message: string;
-    timestamp: number;
-    kind: "status" | "git";
-    command?: string;
-  }
-
   let progressEntries = $state<ProgressEntry[]>([]);
   let activeController: AbortController | null = null;
   const gitEntryLookup = new Map<string, string>();
@@ -285,7 +291,6 @@
     current: number;
     total: number;
   } | null>(null);
-  let descriptions = $state<Array<string | undefined>>([]);
 
   let chartCardElements = $state<Array<HTMLElement | null>>([]);
   let thumbnailUrls = $state<Array<string | null>>([]);
@@ -320,7 +325,10 @@
     }
   });
 
-  async function handleSubmit(event?: SubmitEvent) {
+  async function handleSubmit(
+    event?: SubmitEvent,
+    options?: { cloneMissing?: boolean },
+  ) {
     event?.preventDefault();
     const trimmedOwner = owner.trim();
     const trimmedRepo = repo.trim();
@@ -355,6 +363,13 @@
     const controller = new AbortController();
     activeController = controller;
 
+    console.log("[contrib] handleSubmit start", {
+      owner: trimmedOwner,
+      repo: trimmedRepo,
+      topStarred,
+      limit: contributorLimit,
+    });
+
     loading = true;
     errorMessage = "";
     progressEntries = [];
@@ -362,13 +377,14 @@
     highlightedContributor = null;
     ownerAutocomplete.resetSuggestions();
     repoAutocomplete.resetSuggestions();
-    summaries = [];
+    repoResults = [];
     selectedIndex = 0;
     batchStatus = null;
     await tick();
     chartStrip?.scrollTo({ left: 0, behavior: "auto" });
 
     try {
+      console.log("[contrib] Requesting /api/contribs payload ready");
       const response = await fetch("/api/contribs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -378,11 +394,16 @@
           limit: contributorLimit,
           excludeBots: false,
           topStarred,
+          cloneMissing: options?.cloneMissing ?? false,
         }),
         signal: controller.signal,
       });
 
       const contentType = response.headers.get("content-type") ?? "";
+      console.log("[contrib] Response received", {
+        status: response.status,
+        contentType,
+      });
       if (!contentType.includes("application/x-ndjson")) {
         const fallback = await response
           .json()
@@ -403,95 +424,20 @@
       let receivedComplete = false;
       let receivedError = false;
 
-      const MAX_ENTRIES = 20;
-
-      const appendEntry = (entry: ProgressEntry) => {
-        const next = [...progressEntries, entry];
-        progressEntries =
-          next.length > MAX_ENTRIES
-            ? next.slice(next.length - MAX_ENTRIES)
-            : next;
-      };
-
       const appendStatus = (message: string) => {
-        if (!message) return;
-        const trimmed = message.trim();
-        if (!trimmed) return;
-        const timestamp = Date.now();
-        const last = progressEntries[progressEntries.length - 1];
-        if (last && last.kind === "status" && last.message === trimmed) {
-          progressEntries = [
-            ...progressEntries.slice(0, -1),
-            { ...last, timestamp },
-          ];
-          return;
-        }
-
-        appendEntry({
-          id: `${timestamp}-${Math.random()}`,
-          message: trimmed,
-          timestamp,
-          kind: "status",
-        });
+        progressEntries = appendProgressStatus(
+          progressEntries,
+          message,
+          MAX_PROGRESS_ENTRIES,
+        );
       };
 
       const upsertGitEntry = (command: string, text: string | undefined) => {
-        if (!text) {
-          return;
-        }
-
-        const trimmed = text.trim();
-        if (!trimmed) {
-          return;
-        }
-
-        const timestamp = Date.now();
-        const safeCommand = command || "git";
-        const label = `[${safeCommand}] ${trimmed}`;
-        const existingId = gitEntryLookup.get(safeCommand);
-        if (existingId) {
-          const existingEntry = progressEntries.find(
-            (entry) => entry.id === existingId,
-          );
-          if (!existingEntry) {
-            gitEntryLookup.delete(safeCommand);
-            const id = `${timestamp}-${Math.random()}`;
-            gitEntryLookup.set(safeCommand, id);
-            appendEntry({
-              id,
-              message: label,
-              timestamp,
-              kind: "git",
-              command: safeCommand,
-            });
-            return;
-          }
-
-          const updatedEntry: ProgressEntry = {
-            ...existingEntry,
-            message: label,
-            timestamp,
-          };
-
-          const filtered = progressEntries.filter(
-            (entry) => entry.id !== existingId,
-          );
-          const next = [...filtered, updatedEntry];
-          progressEntries =
-            next.length > MAX_ENTRIES
-              ? next.slice(next.length - MAX_ENTRIES)
-              : next;
-          return;
-        }
-
-        const id = `${timestamp}-${Math.random()}`;
-        gitEntryLookup.set(safeCommand, id);
-        appendEntry({
-          id,
-          message: label,
-          timestamp,
-          kind: "git",
-          command: safeCommand,
+        progressEntries = upsertProgressGitEntry(progressEntries, {
+          command,
+          text,
+          gitEntryLookup,
+          maxEntries: MAX_PROGRESS_ENTRIES,
         });
       };
 
@@ -509,87 +455,94 @@
               }
             | {
                 type: "partial";
-                summary: SummaryPayload;
+                slug: string;
+                summary: SummaryPayload | null;
+                cloned: boolean;
                 index?: number;
                 total?: number;
                 description?: string | null;
               }
             | {
                 type: "complete";
-                summaries?: Array<
-                  SummaryPayload & { description?: string | null }
-                >;
-              }
-            | {
-                type: "result";
-                summary: SummaryPayload & { description?: string | null };
+                entries?: Array<{
+                  slug: string;
+                  description?: string | null;
+                  cloned: boolean;
+                  summary: SummaryPayload | null;
+                }>;
               }
             | { type: "error"; message?: string };
 
           if (event.type === "status") {
             appendStatus(event.message);
+            console.log("[contrib] status event", event.message);
           } else if (event.type === "git") {
             upsertGitEntry(event.command, event.text);
+            console.log("[contrib] git event", {
+              command: event.command,
+              stream: event.stream,
+            });
           } else if (event.type === "partial") {
-            const incoming = event.summary;
-            if (incoming) {
-              const targetIndex = event.index ?? summaries.length;
-              const nextSummaries = [...summaries];
-              const nextDescriptions = [...descriptions];
-              nextSummaries[targetIndex] = incoming;
-              if (event.description !== undefined) {
-                nextDescriptions[targetIndex] = event.description ?? undefined;
-              }
-              const total = event.total ?? nextSummaries.length;
-              batchStatus = {
-                slug: incoming.slug,
-                current: targetIndex + 1,
-                total,
-              };
-              summaries = nextSummaries;
-              descriptions = nextDescriptions;
-              const nextThumbs = [...thumbnailUrls];
-              nextThumbs[targetIndex] = null;
-              thumbnailUrls = nextThumbs;
-              const nextStatuses = [...thumbnailStatus];
-              nextStatuses[targetIndex] = "idle";
-              thumbnailStatus = nextStatuses;
-              selectedIndex = targetIndex;
-              scrollToCard(targetIndex, "auto").catch(() => {});
-            }
+            console.log("[contrib] partial event", {
+              slug: event.slug,
+              index: event.index,
+              total: event.total,
+            });
+            const targetIndex = event.index ?? repoResults.length;
+            const nextResults = [...repoResults];
+            nextResults[targetIndex] = {
+              slug: event.slug,
+              cloned: event.cloned,
+              summary: event.summary,
+              description: event.description ?? undefined,
+            };
+            repoResults = nextResults;
+            const total = event.total ?? nextResults.length;
+            batchStatus = {
+              slug: event.slug,
+              current: Math.min(targetIndex + 1, total),
+              total,
+            };
+            const nextThumbs = [...thumbnailUrls];
+            nextThumbs[targetIndex] = null;
+            thumbnailUrls = nextThumbs;
+            const nextStatuses = [...thumbnailStatus];
+            nextStatuses[targetIndex] = event.summary ? "idle" : "error";
+            thumbnailStatus = nextStatuses;
+            selectedIndex = targetIndex;
+            scrollToCard(targetIndex, "auto").catch(() => {});
           } else if (event.type === "complete") {
-            summaries = event.summaries ?? [];
-            descriptions = (event.summaries ?? []).map(
-              (entry) => entry.description ?? undefined,
+            const entries = event.entries ?? [];
+            repoResults = entries.map((entry) => ({
+              slug: entry.slug,
+              cloned: entry.cloned,
+              summary: entry.summary ?? null,
+              description: entry.description ?? undefined,
+            }));
+            thumbnailUrls = new Array(repoResults.length).fill(null);
+            thumbnailStatus = repoResults.map((entry) =>
+              entry.summary ? "idle" : "error",
             );
-            thumbnailUrls = new Array(summaries.length).fill(null);
-            thumbnailStatus = new Array(summaries.length).fill("idle");
             receivedComplete = true;
             batchStatus = null;
-            if (summaries.length > 0 && selectedIndex >= summaries.length) {
-              selectedIndex = summaries.length - 1;
+            if (repoResults.length > 0 && selectedIndex >= repoResults.length) {
+              selectedIndex = repoResults.length - 1;
             }
+            console.log("[contrib] complete event", {
+              entries: entries.length,
+            });
             scrollToCard(selectedIndex).catch(() => {});
-          } else if (event.type === "result") {
-            summaries = [event.summary];
-            descriptions = [event.summary.description ?? undefined];
-            thumbnailUrls = [null];
-            thumbnailStatus = ["idle"];
-            selectedIndex = 0;
-            receivedComplete = true;
-            batchStatus = null;
-            scrollToCard(0).catch(() => {});
           } else if (event.type === "error") {
             const message =
               event.message ??
               "Unable to gather statistics. Please retry later.";
             errorMessage = message;
-            summaries = [];
-            descriptions = [];
+            repoResults = [];
             thumbnailUrls = [];
             thumbnailStatus = [];
             batchStatus = null;
             receivedError = true;
+            console.log("[contrib] error event", { message });
           }
         } catch (parseError) {
           console.error("Failed to parse progress message", parseError, {
@@ -600,6 +553,7 @@
 
       const processChunk = (chunk: string) => {
         if (!chunk) return;
+        console.log("[contrib] chunk received", { length: chunk.length });
         buffer += chunk;
         let newlineIndex = buffer.indexOf("\n");
         while (newlineIndex !== -1) {
@@ -613,6 +567,7 @@
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
+          console.log("[contrib] stream done");
           break;
         }
         if (value) {
@@ -626,35 +581,36 @@
         buffer = "";
       }
 
-      if (!receivedComplete && summaries.length === 0 && !receivedError) {
+      if (!receivedComplete && repoResults.length === 0 && !receivedError) {
         throw new Error("The server did not return any results.");
       }
     } catch (error) {
+      console.log("[contrib] fetch failed", error);
       if (isAbortError(error)) {
+        console.log("[contrib] fetch aborted");
         return;
       }
       errorMessage = (error as Error).message;
-      summaries = [];
-      descriptions = [];
+      repoResults = [];
     } finally {
       if (activeController === controller) {
         activeController = null;
         loading = false;
+        console.log("[contrib] handleSubmit complete", {
+          loading,
+          error: errorMessage,
+          repos: repoResults.length,
+        });
       }
     }
   }
 
   function useExample(repoExample: { owner: string; repo: string }) {
-    owner = repoExample.owner;
-    repo = repoExample.repo;
-    ownerAutocomplete.setValidationState("valid");
-    ownerAutocomplete.abortValidation();
-    repoAutocomplete.setValidationState("valid");
-    repoAutocomplete.abortValidation();
+    ownerAutocomplete.applySuggestion(repoExample.owner);
+    repoAutocomplete.applySuggestion(repoExample.repo);
     batchStatus = null;
     progressEntries = [];
     gitEntryLookup.clear();
-    descriptions = [];
     ownerAutocomplete.resetSuggestions();
     repoAutocomplete.resetSuggestions();
     void handleSubmit();
@@ -739,27 +695,48 @@
   }
 
   const ownerIsValid = $derived(ownerAutocomplete.validationState === "valid");
-  const filteredSummaries = $derived(
-    summaries.map((entry) => filterBots(entry, excludeBots)),
+  const filteredEntries = $derived(
+    repoResults.map((entry) => ({
+      ...entry,
+      filteredSummary: entry.summary
+        ? filterBots(entry.summary, excludeBots)
+        : null,
+    })),
   );
 
-  const activeSummary = $derived(filteredSummaries[selectedIndex] ?? null);
-
-  const activeDescription = $derived(descriptions[selectedIndex]);
+  const activeEntry = $derived(filteredEntries[selectedIndex] ?? null);
+  const activeSummary = $derived(activeEntry?.filteredSummary ?? null);
+  const activeDescription = $derived(activeEntry?.description);
+  const chartCount = $derived(
+    filteredEntries.filter((entry) => entry.filteredSummary).length,
+  );
 
   $effect(() => {
-    if (filteredSummaries.length === 0) {
+    if (filteredEntries.length === 0) {
       selectedIndex = 0;
       return;
     }
 
-    if (selectedIndex > filteredSummaries.length - 1) {
-      selectedIndex = filteredSummaries.length - 1;
+    if (selectedIndex > filteredEntries.length - 1) {
+      selectedIndex = filteredEntries.length - 1;
     }
   });
 
   $effect(() => {
-    const count = filteredSummaries.length;
+    const count = filteredEntries.length;
+    if (count === 0) {
+      if (chartCardElements.length !== 0) {
+        chartCardElements = [];
+      }
+      if (thumbnailUrls.length !== 0) {
+        thumbnailUrls = [];
+      }
+      if (thumbnailStatus.length !== 0) {
+        thumbnailStatus = [];
+      }
+      return;
+    }
+
     if (chartCardElements.length !== count) {
       const nextCards = [...chartCardElements];
       nextCards.length = count;
@@ -782,14 +759,23 @@
       thumbnailUrls = nextUrls;
     }
 
-    if (thumbnailStatus.length !== count) {
-      const nextStatus = [...thumbnailStatus];
-      nextStatus.length = count;
-      for (let index = 0; index < count; index += 1) {
-        if (!(index in nextStatus)) {
-          nextStatus[index] = "idle";
+    const nextStatus = [...thumbnailStatus];
+    let statusChanged = nextStatus.length !== count;
+    nextStatus.length = count;
+    for (let index = 0; index < count; index += 1) {
+      const hasSummary = Boolean(filteredEntries[index]?.filteredSummary);
+      const current = nextStatus[index];
+      if (!hasSummary) {
+        if (current !== "error") {
+          nextStatus[index] = "error";
+          statusChanged = true;
         }
+      } else if (current === undefined || current === "error") {
+        nextStatus[index] = "idle";
+        statusChanged = true;
       }
+    }
+    if (statusChanged) {
       thumbnailStatus = nextStatus;
     }
   });
@@ -806,7 +792,7 @@
       return { width: 0, max: 0, bounce: 0 };
     }
     const width = chartStrip.clientWidth;
-    const maxIndex = Math.max(filteredSummaries.length - 1, 0);
+    const maxIndex = Math.max(filteredEntries.length - 1, 0);
     const max = width * maxIndex;
     const bounce = width * 0.25;
     return { width, max, bounce };
@@ -914,7 +900,7 @@
     if (Number.isFinite(nextIndex) && nextIndex !== selectedIndex) {
       const clamped = Math.min(
         Math.max(nextIndex, 0),
-        filteredSummaries.length - 1,
+        filteredEntries.length - 1,
       );
       if (clamped !== selectedIndex) {
         selectedIndex = clamped;
@@ -923,7 +909,7 @@
   }
 
   function scheduleSnapRestore() {
-    if (filteredSummaries.length <= 1) {
+    if (filteredEntries.length <= 1) {
       snapEnabled = true;
       suppressScrollSync = false;
       return;
@@ -934,7 +920,7 @@
     }
     snapRestoreId = setTimeout(() => {
       snapRestoreId = null;
-      if (!chartStrip || filteredSummaries.length === 0) {
+      if (!chartStrip || filteredEntries.length === 0) {
         snapEnabled = true;
         suppressScrollSync = false;
         return;
@@ -945,7 +931,7 @@
         const rawIndex = chartStrip.scrollLeft / width;
         const targetIndex = Math.min(
           Math.max(Math.round(rawIndex), 0),
-          filteredSummaries.length - 1,
+          filteredEntries.length - 1,
         );
         if (targetIndex !== selectedIndex) {
           selectedIndex = targetIndex;
@@ -1057,32 +1043,94 @@
     scheduleSnapRestore();
   }
 
-  $effect(() => {
-    filteredSummaries;
-    chartCardElements;
-    (async () => {
-      await tick();
-      for (let index = 0; index < filteredSummaries.length; index += 1) {
-        if (thumbnailStatus[index] === "idle" && chartCardElements[index]) {
-          const nextStatus = [...thumbnailStatus];
-          nextStatus[index] = "pending";
-          thumbnailStatus = nextStatus;
-          const dataUrl = await generateThumbnail(chartCardElements[index]);
-          if (dataUrl) {
-            const nextUrls = [...thumbnailUrls];
-            nextUrls[index] = dataUrl;
-            thumbnailUrls = nextUrls;
-            const nextStatus = [...thumbnailStatus];
-            nextStatus[index] = "ready";
-            thumbnailStatus = nextStatus;
-          } else {
-            const nextStatus = [...thumbnailStatus];
-            nextStatus[index] = "error";
-            thumbnailStatus = nextStatus;
+  const thumbnailQueue = new Set<number>();
+  let thumbnailWorker: Promise<void> | null = null;
+
+  function enqueueThumbnail(index: number) {
+    const currentStatus = thumbnailStatus[index] ?? "idle";
+    if (thumbnailQueue.has(index) || currentStatus !== "idle") {
+      return;
+    }
+    thumbnailQueue.add(index);
+    queueMicrotask(startThumbnailWorker);
+  }
+
+  function startThumbnailWorker() {
+    if (thumbnailWorker || thumbnailQueue.size === 0) {
+      return;
+    }
+    thumbnailWorker = (async () => {
+      while (thumbnailQueue.size > 0) {
+        const iterator = thumbnailQueue.values().next();
+        if (iterator.done) {
+          break;
+        }
+        const index = iterator.value;
+        thumbnailQueue.delete(index);
+        const entry = filteredEntries[index];
+        const card = chartCardElements[index];
+        if (!entry?.filteredSummary || !card) {
+          continue;
+        }
+
+        setThumbnailStatus(index, "pending");
+
+        try {
+          const dataUrl = await generateThumbnail(card);
+          if ((thumbnailStatus[index] ?? "idle") !== "pending") {
+            continue;
           }
+          if (dataUrl) {
+            setThumbnailUrl(index, dataUrl);
+            setThumbnailStatus(index, "ready");
+          } else {
+            setThumbnailStatus(index, "error");
+          }
+        } catch (error) {
+          console.error("Failed to generate thumbnail", error);
+          setThumbnailStatus(index, "error");
         }
       }
-    })().catch((error) => console.error(error));
+    })().finally(() => {
+      thumbnailWorker = null;
+      if (thumbnailQueue.size > 0) {
+        queueMicrotask(startThumbnailWorker);
+      }
+    });
+  }
+
+  function setThumbnailStatus(
+    index: number,
+    status: "idle" | "pending" | "ready" | "error",
+  ) {
+    const next = [...thumbnailStatus];
+    next[index] = status;
+    thumbnailStatus = next;
+  }
+
+  function setThumbnailUrl(index: number, url: string) {
+    const next = [...thumbnailUrls];
+    next[index] = url;
+    thumbnailUrls = next;
+  }
+
+  $effect(() => {
+    filteredEntries;
+    chartCardElements;
+    if (typeof window === "undefined" || repoResults.length === 0) {
+      return;
+    }
+    for (let index = 0; index < filteredEntries.length; index += 1) {
+      const entry = filteredEntries[index];
+      const card = chartCardElements[index];
+      if (!entry?.filteredSummary || !card) {
+        continue;
+      }
+      if ((thumbnailStatus[index] ?? "idle") !== "idle") {
+        continue;
+      }
+      enqueueThumbnail(index);
+    }
   });
 
   function handlePointerUp(event: PointerEvent) {
@@ -1100,6 +1148,13 @@
   function repositoryName(slug: string): string {
     const parts = slug.split("/");
     return parts.length > 1 ? parts[1] : slug;
+  }
+
+  async function cloneRepository(_slug: string) {
+    if (loading) {
+      return;
+    }
+    await handleSubmit(undefined, { cloneMissing: true });
   }
 
   function extractLogin(profileUrl?: string | null): string | null {
@@ -1262,9 +1317,9 @@
       onsubmit={handleSubmit}
     >
       <div class="sm:col-span-2 lg:col-span-3">
-        {#if owner.trim().length >= 0 && owner.trim().length < 3}
+        {#if owner.trim().length > 0 && owner.trim().length < 3}
           <p class="text-sm font-medium text-slate-600">
-            cached results. type more than 2 chars to get the github completion
+            cached results. type more than three chars to get the github completion
           </p>
         {:else}
           <p class="text-sm text-slate-400">&nbsp;</p>
@@ -1385,20 +1440,13 @@
     </div>
 
     {#if progressEntries.length > 0 && loading}
-      <div
-        class="progress"
-        in:fade={{ duration: 200 }}
-        out:fade={{ duration: 200 }}
-      >
-        <p>Progress updates</p>
-        <ul>
-          {#each progressEntries as entry, index}
-            <li class:latest={index === progressEntries.length - 1}>
-              <span class="timestamp">{formatTimestamp(entry.timestamp)}</span>
-              <span>{entry.message}</span>
-            </li>
-          {/each}
-        </ul>
+      <div in:fade={{ duration: 200 }} out:fade={{ duration: 200 }}>
+        <ProgressPanel
+          entries={progressEntries}
+          loading={loading}
+          formatter={formatTimestamp}
+          class="border-none bg-transparent shadow-none"
+        />
       </div>
     {/if}
   </section>
@@ -1408,7 +1456,7 @@
   {/if}
 
   <section class="chart">
-    {#if filteredSummaries.length === 0}
+    {#if filteredEntries.length === 0}
       <div class="chart-card single">
         <ContributionChart
           {loading}
@@ -1440,7 +1488,7 @@
         role="application"
         aria-label="Chart strip"
       >
-        {#each filteredSummaries as item, index}
+        {#each filteredEntries as item, index}
           <article
             class="chart-card"
             class:active={index === selectedIndex}
@@ -1448,43 +1496,62 @@
           >
             <header class="chart-card__header">
               <span class="chart-card__index"
-                >{index + 1}/{filteredSummaries.length}</span
+                >{index + 1}/{filteredEntries.length}</span
               >
               <span class="chart-card__slug">{item.slug}</span>
-              {#if descriptions[index]}
+              {#if item.description}
                 <span class="chart-card__description"
-                  >{descriptions[index]}</span
+                  >{item.description}</span
                 >
               {/if}
             </header>
-            <ContributionChart
-              loading={false}
-              series={item.series}
-              periods={item.periods}
-              interval={item.interval}
-              highlighted={index === selectedIndex
-                ? highlightedContributor
-                : null}
-              on:highlight={(event: CustomEvent<string | null>) => {
-                if (index === selectedIndex) {
-                  setHighlight(event.detail ?? null);
-                }
-              }}
-            />
+            {#if item.filteredSummary}
+              <ContributionChart
+                loading={false}
+                series={item.filteredSummary.series}
+                periods={item.filteredSummary.periods}
+                interval={item.filteredSummary.interval}
+                highlighted={index === selectedIndex
+                  ? highlightedContributor
+                  : null}
+                on:highlight={(event: CustomEvent<string | null>) => {
+                  if (index === selectedIndex) {
+                    setHighlight(event.detail ?? null);
+                  }
+                }}
+              />
+              <p class="mt-3 text-sm font-semibold text-green-600">
+                Cloned locally
+              </p>
+            {:else}
+              <div class="mt-4 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600">
+                <p class="mb-3">
+                  Clone this repository to generate contributor statistics.
+                </p>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+                  disabled={loading}
+                  onclick={() => cloneRepository(item.slug)}
+                >
+                  Clone repository
+                </button>
+              </div>
+            {/if}
           </article>
         {/each}
       </div>
     {/if}
   </section>
-  {#if filteredSummaries.length > 1}
+  {#if chartCount > 1}
     <p class="chart-hint">
       Swipe horizontally or use trackpad scroll to pan between charts.
     </p>
   {/if}
 
-  {#if filteredSummaries.length > 0}
+  {#if filteredEntries.length > 0}
     <div class="thumbnail-strip" aria-label="Chart thumbnails">
-      {#each filteredSummaries as summary, index}
+      {#each filteredEntries as summary, index}
         <button
           type="button"
           class="thumbnail"
@@ -1501,15 +1568,17 @@
           aria-label={`Show ${summary.slug}`}
         >
           <span class="thumbnail__label">{repositoryName(summary.slug)}</span>
-          {#if thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
+          {#if summary.filteredSummary && thumbnailStatus[index] === "ready" && thumbnailUrls[index]}
             <img
               src={thumbnailUrls[index] ?? ""}
               alt={`Preview of ${summary.slug}`}
             />
-          {:else if thumbnailStatus[index] === "pending"}
+          {:else if summary.filteredSummary && thumbnailStatus[index] === "pending"}
             <span class="thumbnail__placeholder">Rendering…</span>
-          {:else}
+          {:else if summary.filteredSummary}
             <span class="thumbnail__placeholder">Preview unavailable</span>
+          {:else}
+            <span class="thumbnail__placeholder">Not cloned</span>
           {/if}
         </button>
       {/each}
@@ -1623,6 +1692,19 @@
         </table>
       </div>
     </section>
+  {:else if activeEntry}
+    <section class="summary summary--placeholder">
+      <h2>
+        <a
+          href={`${GITHUB_BASE_URL}/${activeEntry.slug}`}
+          target="_blank"
+          rel="noreferrer noopener"
+        >
+          {activeEntry.slug}
+        </a>
+      </h2>
+      <p>Clone this repository to view contributor statistics.</p>
+    </section>
   {/if}
 </div>
 
@@ -1693,47 +1775,6 @@
     display: grid;
     gap: 0.5rem;
     color: #555;
-  }
-
-  .progress {
-    background: #f1f5f9;
-    border-radius: 12px;
-    padding: 1rem 1.25rem;
-    display: grid;
-    gap: 0.5rem;
-  }
-
-  .progress p {
-    margin: 0;
-    font-weight: 600;
-    font-size: 0.9rem;
-    color: #1f2937;
-  }
-
-  .progress ul {
-    margin: 0;
-    padding-left: 1.1rem;
-    display: grid;
-    gap: 0.35rem;
-    font-size: 0.9rem;
-    color: #374151;
-  }
-
-  .progress li.latest {
-    color: #1d4ed8;
-    font-weight: 600;
-  }
-
-  .progress li {
-    display: flex;
-    gap: 0.4rem;
-    align-items: baseline;
-  }
-
-  .timestamp {
-    font-variant-numeric: tabular-nums;
-    color: #1f2937;
-    opacity: 0.7;
   }
 
   .example-buttons {
@@ -1949,6 +1990,14 @@
     gap: 1rem;
   }
 
+  .summary--placeholder {
+    background: #f8fafc;
+    border: 1px dashed rgba(148, 163, 184, 0.6);
+    align-items: center;
+    justify-items: center;
+    text-align: center;
+  }
+
   .summary h2 {
     margin: 0;
     font-size: 1.5rem;
@@ -1963,6 +2012,10 @@
   .summary p {
     margin: 0;
     color: #525252;
+  }
+
+  .summary--placeholder p {
+    color: #475569;
   }
 
   .table-container {

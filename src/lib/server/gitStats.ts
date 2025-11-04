@@ -40,6 +40,9 @@ type ProgressCallback = (event: ProgressEvent) => void;
 export interface ContributionSummaryOptions {
 	onProgress?: ProgressCallback;
 	signal?: AbortSignal;
+	cloneIfMissing?: boolean;
+	maxProfileLookups?: number;
+	profileLookupConcurrency?: number;
 }
 
 const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
@@ -51,6 +54,8 @@ const githubProfileCache = new Map<string, string | null>();
 const githubNameCache = new Map<string, string | null>();
 const githubProfileStore = createPersistentCache<string | null>('github-profiles-by-email.json');
 const githubNameStore = createPersistentCache<string | null>('github-profiles-by-name.json');
+const DEFAULT_MAX_PROFILE_LOOKUPS = 60;
+const DEFAULT_PROFILE_LOOKUP_CONCURRENCY = 3;
 
 async function hydrateEmailProfileCache(normalizedEmail: string | null): Promise<void> {
 	if (!normalizedEmail || githubProfileCache.has(normalizedEmail)) {
@@ -122,6 +127,11 @@ function throwIfAborted(signal?: AbortSignal): void {
 	const abortError = new Error('The operation was aborted.');
 	abortError.name = 'AbortError';
 	throw abortError;
+}
+
+function isReadOnlyGitError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /permission denied/i.test(message) || /operation not permitted/i.test(message) || /read-only file system/i.test(message);
 }
 
 function parseSlug(slug: string): { owner: string; name: string } {
@@ -210,21 +220,43 @@ async function ensureFullClone(
 	throwIfAborted(signal);
 	const fetchArgs = ['fetch', '--progress', '--all', '--tags'];
 	onProgress?.({ type: 'status', message: 'Fetching remote references...' });
-	await runCommand('git', fetchArgs, {
-		cwd: repoPath,
-		...createGitProgressHandlers('git fetch --all --tags', onProgress),
-		signal
-	});
+	let readOnlyRepository = false;
+	try {
+		await runCommand('git', fetchArgs, {
+			cwd: repoPath,
+			...createGitProgressHandlers('git fetch --all --tags', onProgress),
+			signal
+		});
+	} catch (error) {
+		if (isReadOnlyGitError(error)) {
+			onProgress?.({ type: 'status', message: 'Skipping fetch: repository appears read-only.' });
+			readOnlyRepository = true;
+		} else {
+			throw error;
+		}
+	}
 
 	throwIfAborted(signal);
 	const isShallow = await runCommand('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoPath, signal });
 	if (isShallow === 'true') {
-		onProgress?.({ type: 'status', message: 'Expanding shallow clone...' });
-		await runCommand('git', ['fetch', '--progress', '--unshallow'], {
-			cwd: repoPath,
-			...createGitProgressHandlers('git fetch --unshallow', onProgress),
-			signal
-		});
+		if (readOnlyRepository) {
+			onProgress?.({ type: 'status', message: 'Unable to expand shallow clone: repository is read-only.' });
+		} else {
+			onProgress?.({ type: 'status', message: 'Expanding shallow clone...' });
+			try {
+				await runCommand('git', ['fetch', '--progress', '--unshallow'], {
+					cwd: repoPath,
+					...createGitProgressHandlers('git fetch --unshallow', onProgress),
+					signal
+				});
+			} catch (error) {
+				if (isReadOnlyGitError(error)) {
+					onProgress?.({ type: 'status', message: 'Unable to expand shallow clone: repository is read-only.' });
+				} else {
+					throw error;
+				}
+			}
+		}
 	}
 }
 
@@ -235,6 +267,9 @@ async function initialiseRepository(slug: string, options?: ContributionSummaryO
 	await mkdir(baseDir, { recursive: true });
 
 	if (!existsSync(repoPath)) {
+		if (options?.cloneIfMissing === false) {
+			throw new RepositoryNotClonedError(slug);
+		}
 		const cloneUrl = `${GITHUB_BASE_URL}/${slug}.git`;
 		options?.onProgress?.({ type: 'status', message: `Cloning ${slug} for the first time...` });
 		await runCommand('git', ['clone', '--progress', '--no-tags', cloneUrl, repoPath], {
@@ -464,15 +499,79 @@ async function fetchProfilesForEmails(
 	slug: string,
 	repoPath: string,
 	lookups: Iterable<[string, { email: string; name: string }]>,
-	signal?: AbortSignal
+	options?: {
+		signal?: AbortSignal;
+		onProgress?: ProgressCallback;
+		maxLookups?: number;
+		concurrency?: number;
+	}
 ): Promise<Map<string, string>> {
 	const resolved = new Map<string, string>();
-	for (const [normalizedEmail, { email, name }] of lookups) {
-		throwIfAborted(signal);
-		const profileUrl = await lookupProfileUrlFromGitHub(slug, repoPath, email, name, signal).catch(() => undefined);
-		if (profileUrl) {
-			resolved.set(normalizedEmail, profileUrl);
+	const entries = Array.from(lookups);
+	if (entries.length === 0) {
+		return resolved;
+	}
+	const maxLookups = Math.max(0, options?.maxLookups ?? DEFAULT_MAX_PROFILE_LOOKUPS);
+	const limited = entries.slice(0, maxLookups);
+	const total = limited.length;
+	const concurrency = Math.max(1, options?.concurrency ?? DEFAULT_PROFILE_LOOKUP_CONCURRENCY);
+
+	if (total === 0) {
+		if (entries.length > 0 && options?.onProgress) {
+			options.onProgress({
+				type: 'status',
+				message: `Skipped ${entries.length} contributor profile lookups.`
+			});
 		}
+		return resolved;
+	}
+	let index = 0;
+
+	const notifyProgress = () => {
+		if (!options?.onProgress) {
+			return;
+		}
+		options.onProgress({
+			type: 'status',
+			message: `Resolving contributor profiles (${Math.min(index, total)} of ${total})`
+		});
+	};
+
+	const queue: Array<[string, { email: string; name: string }]> = [...limited];
+	const workers: Array<Promise<void>> = [];
+
+	const runNext = async (): Promise<void> => {
+		const next = queue.shift();
+		if (!next) {
+			return;
+		}
+		const [normalizedEmail, { email, name }] = next;
+		try {
+			throwIfAborted(options?.signal);
+			const profileUrl = await lookupProfileUrlFromGitHub(slug, repoPath, email, name, options?.signal).catch(() => undefined);
+			if (profileUrl) {
+				resolved.set(normalizedEmail, profileUrl);
+			}
+		} finally {
+			index += 1;
+			notifyProgress();
+			if (queue.length > 0) {
+				await runNext();
+			}
+		}
+	};
+
+	notifyProgress();
+	for (let worker = 0; worker < concurrency; worker += 1) {
+		workers.push(runNext());
+	}
+	await Promise.all(workers);
+
+	if (entries.length > limited.length && options?.onProgress) {
+		options.onProgress({
+			type: 'status',
+			message: `Skipped ${entries.length - limited.length} additional contributor profile lookups.`
+		});
 	}
 	return resolved;
 }
@@ -717,12 +816,12 @@ export async function collectContributionSummary(
 	}
 
 	if (pendingProfileLookups.size > 0) {
-		const resolvedProfiles = await fetchProfilesForEmails(
-			slug,
-			repoPath,
-			pendingProfileLookups,
-			options?.signal
-		);
+		const resolvedProfiles = await fetchProfilesForEmails(slug, repoPath, pendingProfileLookups, {
+			signal: options?.signal,
+			onProgress: options?.onProgress,
+			maxLookups: options?.maxProfileLookups,
+			concurrency: options?.profileLookupConcurrency
+		});
 
 		for (const [normalizedEmail, profileUrl] of resolvedProfiles) {
 			const lookup = pendingProfileLookups.get(normalizedEmail);
@@ -772,4 +871,13 @@ export async function collectContributionSummary(
 		periods,
 		series
 	};
+}
+export class RepositoryNotClonedError extends Error {
+	constructor(slug: string) {
+		super(`Repository "${slug}" has not been cloned yet.`);
+		this.name = 'RepositoryNotClonedError';
+		this.slug = slug;
+	}
+
+	readonly slug: string;
 }

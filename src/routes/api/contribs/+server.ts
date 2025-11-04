@@ -1,5 +1,9 @@
 import { json } from '@sveltejs/kit';
-import { collectContributionSummary, type ProgressEvent } from '$lib/server/gitStats';
+import {
+	collectContributionSummary,
+	type ProgressEvent,
+	RepositoryNotClonedError
+} from '$lib/server/gitStats';
 import type { RepoContributionSummary } from '$lib/types';
 import type { RequestHandler } from './$types';
 
@@ -9,6 +13,7 @@ interface RequestPayload {
 	limit?: number;
 	excludeBots?: boolean;
 	topStarred?: boolean;
+	cloneMissing?: boolean;
 }
 
 function serializeSummary(summary: RepoContributionSummary) {
@@ -95,6 +100,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const limit = Number(body.limit ?? 5);
 	const excludeBots = body.excludeBots === true;
 	const topStarred = body.topStarred === true;
+	const cloneMissing = body.cloneMissing === true;
 
 	if (!Number.isFinite(limit) || limit <= 0) {
 		return json({ error: 'The contributor limit must be a positive integer.' }, { status: 400 });
@@ -180,33 +186,70 @@ export const POST: RequestHandler = async ({ request }) => {
 								return;
 							}
 
-const collected: RepoContributionSummary[] = [];
+const collected: Array<{
+	slug: string;
+	summary: RepoContributionSummary | null;
+	description?: string | null;
+	cloned: boolean;
+}> = [];
 							for (const [index, currentSlug] of slugs.entries()) {
 								send({
 									type: 'status',
 									message: `Processing ${currentSlug} (${index + 1}/${slugs.length})`
 								});
 
-const summary = await collectContributionSummary(currentSlug, limit, {
-									onProgress: handleProgress,
-									signal
-								});
-								const finalSummary = excludeBots ? filterBotContributors(summary) : summary;
-								collected[index] = finalSummary;
-								send({
-									type: 'partial',
-									index,
-									total: slugs.length,
-									summary: serializeSummary(finalSummary),
-									description: repoSummaries[index]?.description ?? null
-								});
+								try {
+									const summary = await collectContributionSummary(currentSlug, limit, {
+										onProgress: handleProgress,
+										signal,
+										cloneIfMissing: cloneMissing
+									});
+									const finalSummary = excludeBots ? filterBotContributors(summary) : summary;
+									collected[index] = {
+										slug: currentSlug,
+										summary: finalSummary,
+										description: repoSummaries[index]?.description ?? null,
+										cloned: true
+									};
+									send({
+										type: 'partial',
+										index,
+										total: slugs.length,
+										summary: serializeSummary(finalSummary),
+										description: repoSummaries[index]?.description ?? null,
+										cloned: true,
+										slug: currentSlug
+									});
+								} catch (error) {
+									if (error instanceof RepositoryNotClonedError) {
+										collected[index] = {
+											slug: currentSlug,
+											summary: null,
+											description: repoSummaries[index]?.description ?? null,
+											cloned: false
+										};
+										send({
+											type: 'partial',
+											index,
+											total: slugs.length,
+											summary: null,
+											description: repoSummaries[index]?.description ?? null,
+											cloned: false,
+											slug: currentSlug
+										});
+										continue;
+									}
+									throw error;
+								}
 							}
 
 							send({
 								type: 'complete',
-								summaries: collected.map((entry, idx) => ({
-									...serializeSummary(entry),
-									description: repoSummaries[idx]?.description ?? null
+								entries: collected.map((entry, idx) => ({
+									slug: entry.slug,
+									cloned: entry.cloned,
+									description: entry.description ?? null,
+									summary: entry.summary ? serializeSummary(entry.summary) : null
 								}))
 							});
 						} catch (error) {

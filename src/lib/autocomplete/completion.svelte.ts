@@ -51,6 +51,15 @@ export function createAutocomplete(getValue: () => string, options: Autocomplete
     suggestionNote = null;
     suggestionIndex = -1;
     value = manualValue;
+    if (suggestionDebounce) {
+      clearTimeout(suggestionDebounce);
+      suggestionDebounce = undefined;
+    }
+    if (validationDebounce) {
+      clearTimeout(validationDebounce);
+      validationDebounce = undefined;
+    }
+    abortSuggestions();
   }
 
   async function loadSuggestions(query: string) {
